@@ -1,0 +1,248 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// SOURCES — Where streams come from
+// ============================================================
+
+enum SourceType {
+  M3U
+  XTREAM
+}
+
+model Source {
+  id           String     @id @default(uuid())
+  name         String                          // User-friendly name ("My IPTV Provider")
+  type         SourceType
+  // M3U fields
+  m3uUrl       String?                         // M3U playlist URL
+  // Xtream fields
+  xcHost       String?                         // Xtream server URL
+  xcUsername   String?
+  xcPassword   String?
+  // EPG
+  epgUrl       String?                         // XMLTV URL (null if using XC EPG)
+  // Sync
+  lastSyncAt   DateTime?
+  syncError    String?
+  refreshDaily Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  // Relations
+  channels     Channel[]
+}
+
+// ============================================================
+// CHANNELS — Normalized from M3U or Xtream
+// ============================================================
+
+model Channel {
+  id            String   @id @default(uuid())
+  sourceId      String
+  source        Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  // Identity
+  name          String                         // Channel display name
+  channelNumber Int?                           // Channel number if available
+  groupTitle    String?                        // Group/category from M3U
+  // Stream
+  streamUrl     String                         // Direct stream URL
+  streamType    String   @default("hls")       // "hls" or "mpegts"
+  // Metadata
+  tvgId         String?                        // EPG matching ID
+  tvgName       String?                        // EPG matching name
+  tvgLogo       String?                        // Channel logo URL
+  // Xtream-specific
+  xcStreamId    Int?                           // Xtream stream ID
+  xcCategoryId  Int?                           // Xtream category ID
+  // State
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  // Relations
+  programs      Program[]
+  recordingRules RecordingRule[]
+  recordings    Recording[]
+
+  @@index([tvgId])
+  @@index([sourceId])
+  @@index([name])
+}
+
+// ============================================================
+// EPG — Program guide data
+// ============================================================
+
+model Program {
+  id          String   @id @default(uuid())
+  channelId   String
+  channel     Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  // Program info
+  title       String
+  subtitle    String?                          // Episode title
+  description String?
+  category    String?                          // Genre/category
+  // Timing
+  startTime   DateTime
+  endTime     DateTime
+  // Episode info (from EPG)
+  season      Int?
+  episode     Int?
+  // Metadata
+  iconUrl     String?                          // Program artwork from EPG
+  isNew       Boolean  @default(false)         // New episode flag
+  // Relations
+  recordings  Recording[]
+
+  @@unique([channelId, startTime])
+  @@index([channelId, startTime])
+  @@index([title])
+  @@index([startTime, endTime])
+}
+
+// ============================================================
+// RECORDING RULES — What to record
+// ============================================================
+
+enum RuleType {
+  SERIES                                       // Record all matching episodes
+  ONCE                                         // Record one specific airing
+  MANUAL                                       // Record channel + time window (no EPG match)
+}
+
+enum NewOnlyMode {
+  ALL                                          // Record all airings
+  NEW_ONLY                                     // Only new episodes
+}
+
+model RecordingRule {
+  id          String      @id @default(uuid())
+  type        RuleType
+  // What to match
+  channelId   String?                          // Specific channel (null = any channel)
+  channel     Channel?    @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  seriesTitle String?                          // Title pattern to match in EPG (for SERIES)
+  programId   String?                          // Specific program (for ONCE)
+  // Manual recording fields
+  manualStart DateTime?                        // Manual start time
+  manualEnd   DateTime?                        // Manual end time
+  // Options
+  newOnly     NewOnlyMode @default(ALL)
+  priority    Int         @default(50)         // Higher = more important (1-100)
+  enabled     Boolean     @default(true)
+  // Retention
+  keepLast    Int?                             // Keep last N episodes (null = use global)
+  // Timing adjustments
+  startEarly  Int         @default(0)          // Seconds to start before EPG time
+  endLate     Int         @default(0)          // Seconds to continue after EPG time
+  // State
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  // Relations
+  recordings  Recording[]
+
+  @@index([seriesTitle])
+  @@index([type])
+}
+
+// ============================================================
+// RECORDINGS — Actual recorded content
+// ============================================================
+
+enum RecordingStatus {
+  SCHEDULED                                    // Queued, waiting for start time
+  RECORDING                                    // ffmpeg actively capturing
+  POST_PROCESSING                              // comskip/rename/TMDB in progress
+  COMPLETED                                    // Done, in library
+  FAILED                                       // Recording failed
+  CANCELLED                                    // Cancelled by user
+}
+
+model Recording {
+  id              String          @id @default(uuid())
+  // Links
+  ruleId          String?
+  rule            RecordingRule?  @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  channelId       String
+  channel         Channel         @relation(fields: [channelId], references: [id])
+  programId       String?
+  program         Program?        @relation(fields: [programId], references: [id], onDelete: SetNull)
+  // Program metadata (denormalized for when EPG data gets purged)
+  title           String                       // Show name
+  subtitle        String?                      // Episode title
+  description     String?
+  season          Int?
+  episode         Int?
+  category        String?
+  // Timing
+  scheduledStart  DateTime
+  scheduledEnd    DateTime
+  actualStart     DateTime?
+  actualEnd       DateTime?
+  // File info
+  filePath        String?                      // Final file path after post-processing
+  livePath        String?                      // HLS path during recording
+  fileSize        BigInt?                      // Bytes
+  duration        Int?                         // Seconds
+  // Post-processing
+  comskipStatus   String?                      // "pending" | "running" | "done" | "failed" | "skipped"
+  edlPath         String?                      // Path to EDL file
+  tmdbId          Int?                         // TMDB show/movie ID
+  posterUrl       String?                      // TMDB poster URL
+  backdropUrl     String?                      // TMDB backdrop URL
+  sidecarPath     String?                      // Path to sidecar JSON
+  // State
+  status          RecordingStatus @default(SCHEDULED)
+  errorMessage    String?
+  ffmpegPid       Int?                         // PID of active ffmpeg process
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([status])
+  @@index([scheduledStart])
+  @@index([title])
+  @@index([ruleId])
+}
+
+// ============================================================
+// NOTIFICATIONS — In-app notification log
+// ============================================================
+
+enum NotificationType {
+  RECORDING_STARTED
+  RECORDING_COMPLETED
+  RECORDING_FAILED
+  DISK_WARNING
+  SOURCE_SYNC_ERROR
+  SYSTEM
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  type      NotificationType
+  title     String
+  message   String
+  read      Boolean          @default(false)
+  data      Json?                              // Optional structured data
+  createdAt DateTime         @default(now())
+
+  @@index([createdAt])
+  @@index([read])
+}
+
+// ============================================================
+// SETTINGS — Key-value app settings
+// ============================================================
+
+model Setting {
+  key       String   @id
+  value     String                             // JSON-encoded value
+  updatedAt DateTime @updatedAt
+}

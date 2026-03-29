@@ -1,0 +1,27 @@
+{
+  "name": "anywhereDVR",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless containerized DVR engine for IPTV streams",
+  "workspaces": [
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev:server",
+    "dev:server": "npm run dev --workspace=packages/server",
+    "dev:web": "npm run dev --workspace=packages/web",
+    "build": "npm run build:web && npm run build:server",
+    "build:server": "npm run build --workspace=packages/server",
+    "build:web": "npm run build --workspace=packages/web",
+    "db:migrate": "npx prisma migrate dev",
+    "db:push": "npx prisma db push",
+    "db:seed": "npx tsx prisma/seed.ts",
+    "db:studio": "npx prisma studio",
+    "test": "npm run test --workspace=packages/server",
+    "lint": "eslint packages/*/src/**/*.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

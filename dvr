@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# dvr — AnywhereDVR CLI (fully containerized)
+# Usage: ./dvr <command> [subcommand]
+set -euo pipefail
+cd "$(dirname "$0")"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+DIM='\033[2m'
+NC='\033[0m'
+
+DEV_COMPOSE="docker compose -f docker-compose.dev.yml"
+PROD_COMPOSE="docker compose -f docker-compose.yml"
+
+# Read host port from .env (the port exposed to the host, defaults to 3001)
+HOST_PORT=$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2 || echo 3001)
+
+# ─── Helpers ──────────────────────────────────────────────
+
+wait_for_db() {
+  local container="${1:-anywhereDVR-db}"
+  echo -e "  Waiting for ${container} to be healthy..."
+  until docker exec "$container" pg_isready -U anywhereDVR -q 2>/dev/null; do
+    sleep 1
+  done
+  echo -e "${GREEN}  ✓ Database ready${NC}"
+}
+
+wait_for_server() {
+  local port="${1:-$HOST_PORT}"
+  local max=30
+  local i=0
+  while [ $i -lt $max ]; do
+    if curl -s -o /dev/null "http://localhost:${port}/api/v1/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+smoke_test() {
+  local port="${1:-$HOST_PORT}"
+  echo -e "${YELLOW}▶ Smoke testing API at http://localhost:${port}${NC}"
+
+  local PASS=0
+  local FAIL=0
+
+  check() {
+    local label="$1" url="$2" expected="${3:-200}"
+    local status
+    status=$(curl -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
+    if [ "$status" = "$expected" ]; then
+      echo -e "  ${GREEN}✓${NC} $label ${DIM}($status)${NC}"
+      PASS=$((PASS + 1))
+    else
+      echo -e "  ${RED}✗${NC} $label — expected $expected, got $status"
+      FAIL=$((FAIL + 1))
+    fi
+  }
+
+  check "GET /api/v1/health"               "http://localhost:${port}/api/v1/health"
+  check "GET /api/v1/sources"              "http://localhost:${port}/api/v1/sources"
+  check "GET /api/v1/channels"             "http://localhost:${port}/api/v1/channels"
+  check "GET /api/v1/channels/groups/list" "http://localhost:${port}/api/v1/channels/groups/list"
+  check "GET /api/v1/channels/search (no q)" "http://localhost:${port}/api/v1/channels/search" "400"
+
+  echo ""
+  echo -e "  ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}"
+  [ "$FAIL" -gt 0 ] && return 1 || return 0
+}
+
+# ─── Commands ─────────────────────────────────────────────
+
+cmd_dev() {
+  local sub="${1:-up}"
+  case "$sub" in
+    up)
+      echo -e "${GREEN}▶ AnywhereDVR — Dev Stack${NC}"
+      echo -e "  Building and starting db + server..."
+      echo ""
+      $DEV_COMPOSE up --build
+      ;;
+    up-d)
+      echo -e "${GREEN}▶ AnywhereDVR — Dev Stack (detached)${NC}"
+      $DEV_COMPOSE up --build -d
+      echo ""
+      echo -e "  Waiting for server..."
+      if wait_for_server; then
+        echo -e "${GREEN}  ✓ Server running at http://localhost:${HOST_PORT}${NC}"
+      else
+        echo -e "${RED}  ✗ Server didn't start in time. Check: ./dvr logs server${NC}"
+        exit 1
+      fi
+      ;;
+    down)
+      echo -e "${YELLOW}▶ Stopping dev stack...${NC}"
+      $DEV_COMPOSE down
+      echo -e "${GREEN}  ✓ Stopped${NC}"
+      ;;
+    restart)
+      echo -e "${YELLOW}▶ Restarting dev stack...${NC}"
+      $DEV_COMPOSE restart
+      echo -e "${GREEN}  ✓ Restarted${NC}"
+      ;;
+    rebuild)
+      echo -e "${YELLOW}▶ Rebuilding dev server (no cache)...${NC}"
+      $DEV_COMPOSE build --no-cache server
+      $DEV_COMPOSE up -d
+      echo -e "${GREEN}  ✓ Rebuilt and running${NC}"
+      ;;
+    help|*)
+      echo "Usage: ./dvr dev <command>"
+      echo ""
+      echo "  up         Start in foreground (default)"
+      echo "  up-d       Start detached"
+      echo "  down       Stop everything"
+      echo "  restart    Restart services"
+      echo "  rebuild    Rebuild server image (no cache)"
+      ;;
+  esac
+}
+
+cmd_prod() {
+  local sub="${1:-help}"
+  case "$sub" in
+    up)
+      echo -e "${GREEN}▶ AnywhereDVR — Production Stack${NC}"
+      $PROD_COMPOSE up --build -d
+      echo ""
+      echo -e "  Waiting for server..."
+      if wait_for_server 3000; then
+        echo -e "${GREEN}  ✓ Production running at http://localhost:3000${NC}"
+      else
+        echo -e "${RED}  ✗ Server didn't start in time. Check: ./dvr prod logs${NC}"
+        exit 1
+      fi
+      ;;
+    down)
+      echo -e "${YELLOW}▶ Stopping production stack...${NC}"
+      $PROD_COMPOSE down
+      echo -e "${GREEN}  ✓ Stopped${NC}"
+      ;;
+    logs)
+      $PROD_COMPOSE logs -f "${2:-}"
+      ;;
+    help|*)
+      echo "Usage: ./dvr prod <command>"
+      echo ""
+      echo "  up         Build and start production"
+      echo "  down       Stop production"
+      echo "  logs       Tail logs (optional: service name)"
+      ;;
+  esac
+}
+
+cmd_status() {
+  echo -e "${BLUE}━━━ AnywhereDVR Status ━━━${NC}"
+  echo ""
+
+  # Dev database
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q anywhereDVR-db; then
+    echo -e "  Dev DB:      ${GREEN}● running${NC}"
+  else
+    echo -e "  Dev DB:      ${RED}○ stopped${NC}"
+  fi
+
+  # Dev server
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q anywhereDVR-dev; then
+    echo -e "  Dev Server:  ${GREEN}● running${NC} (port ${HOST_PORT})"
+  else
+    echo -e "  Dev Server:  ${RED}○ stopped${NC}"
+  fi
+
+  # Prod server
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'anywhereDVR$'; then
+    echo -e "  Prod Server: ${GREEN}● running${NC} (port 3000)"
+  else
+    echo -e "  Prod Server: ${RED}○ stopped${NC}"
+  fi
+
+  # Dev API health
+  if curl -s -o /dev/null "http://localhost:${HOST_PORT}/api/v1/health" 2>/dev/null; then
+    echo -e "  Dev API:     ${GREEN}● healthy${NC}"
+  else
+    echo -e "  Dev API:     ${RED}○ unreachable${NC}"
+  fi
+
+  # DB row counts (from dev db)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q anywhereDVR-db; then
+    SOURCES=$(docker exec anywhereDVR-db psql -U anywhereDVR -d anywhereDVR -t -c "SELECT count(*) FROM \"Source\";" 2>/dev/null | tr -d ' ' || echo "?")
+    CHANNELS=$(docker exec anywhereDVR-db psql -U anywhereDVR -d anywhereDVR -t -c "SELECT count(*) FROM \"Channel\";" 2>/dev/null | tr -d ' ' || echo "?")
+    echo ""
+    echo -e "  Sources:     ${BLUE}${SOURCES}${NC}"
+    echo -e "  Channels:    ${BLUE}${CHANNELS}${NC}"
+  fi
+  echo ""
+}
+
+cmd_db() {
+  local sub="${1:-help}"
+  case "$sub" in
+    start)
+      echo -e "${YELLOW}▶ Starting database...${NC}"
+      $DEV_COMPOSE up -d db
+      wait_for_db
+      ;;
+    stop)
+      echo -e "${YELLOW}▶ Stopping database...${NC}"
+      $DEV_COMPOSE stop db
+      echo -e "${GREEN}  ✓ Stopped${NC}"
+      ;;
+    reset)
+      echo -e "${RED}▶ Resetting database (destroys all data)${NC}"
+      read -p "  Are you sure? [y/N] " -n 1 -r; echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        $DEV_COMPOSE down -v
+        $DEV_COMPOSE up -d db
+        wait_for_db
+        # Run Prisma push + seed inside server container
+        $DEV_COMPOSE run --rm server sh -c "npx prisma db push && npx tsx prisma/seed.ts"
+        echo -e "${GREEN}  ✓ Database reset and re-seeded${NC}"
+      else
+        echo "  Cancelled."
+      fi
+      ;;
+    push)
+      echo -e "${YELLOW}▶ Pushing schema...${NC}"
+      $DEV_COMPOSE run --rm server npx prisma db push
+      echo -e "${GREEN}  ✓ Schema synced${NC}"
+      ;;
+    migrate)
+      echo -e "${YELLOW}▶ Running Prisma migrate dev...${NC}"
+      $DEV_COMPOSE run --rm server npx prisma migrate dev
+      ;;
+    seed)
+      echo -e "${YELLOW}▶ Seeding defaults...${NC}"
+      $DEV_COMPOSE run --rm server npx tsx prisma/seed.ts
+      echo -e "${GREEN}  ✓ Seeded${NC}"
+      ;;
+    studio)
+      echo -e "${YELLOW}▶ Starting Prisma Studio...${NC}"
+      echo -e "  ${DIM}(runs on host — needs local npm install)${NC}"
+      DATABASE_URL="postgresql://anywhereDVR:anywhereDVR_dev@localhost:5432/anywhereDVR" npx prisma studio
+      ;;
+    logs)
+      $DEV_COMPOSE logs -f db
+      ;;
+    shell)
+      docker exec -it anywhereDVR-db psql -U anywhereDVR -d anywhereDVR
+      ;;
+    help|*)
+      echo "Usage: ./dvr db <command>"
+      echo ""
+      echo "  start    Start PostgreSQL container"
+      echo "  stop     Stop container (keeps data)"
+      echo "  reset    Destroy + recreate + push + seed"
+      echo "  push     Push Prisma schema to DB"
+      echo "  migrate  Run prisma migrate dev"
+      echo "  seed     Seed default settings"
+      echo "  studio   Open Prisma Studio (runs on host)"
+      echo "  logs     Tail container logs"
+      echo "  shell    Open psql shell"
+      ;;
+  esac
+}
+
+cmd_build() {
+  local sub="${1:-all}"
+  case "$sub" in
+    server)
+      echo -e "${YELLOW}▶ Building server (dev image)...${NC}"
+      $DEV_COMPOSE build server
+      echo -e "${GREEN}  ✓ Dev server image built${NC}"
+      ;;
+    prod)
+      echo -e "${YELLOW}▶ Building production image...${NC}"
+      $PROD_COMPOSE build server
+      echo -e "${GREEN}  ✓ Production image built${NC}"
+      ;;
+    all)
+      echo -e "${YELLOW}▶ Building all images...${NC}"
+      $DEV_COMPOSE build
+      echo -e "${GREEN}  ✓ Dev images built${NC}"
+      $PROD_COMPOSE build
+      echo -e "${GREEN}  ✓ Production images built${NC}"
+      ;;
+    check)
+      echo -e "${YELLOW}▶ Type-check (runs in container)...${NC}"
+      $DEV_COMPOSE run --rm server npx tsc --noEmit --project packages/server/tsconfig.json
+      echo -e "${GREEN}  ✓ No type errors${NC}"
+      ;;
+    help|*)
+      echo "Usage: ./dvr build <command>"
+      echo ""
+      echo "  server   Build dev server image"
+      echo "  prod     Build production image"
+      echo "  all      Build everything (default)"
+      echo "  check    Type-check without emitting JS"
+      ;;
+  esac
+}
+
+cmd_test() {
+  local sub="${1:-all}"
+  case "$sub" in
+    unit)
+      echo -e "${YELLOW}▶ Running unit tests...${NC}"
+      $DEV_COMPOSE run --rm server npx vitest run
+      ;;
+    smoke)
+      smoke_test
+      ;;
+    all)
+      echo -e "${GREEN}▶ Running all tests${NC}"
+      echo ""
+      # Smoke tests (server must be running)
+      if curl -s -o /dev/null "http://localhost:${HOST_PORT}/api/v1/health" 2>/dev/null; then
+        smoke_test
+      else
+        echo -e "${YELLOW}  ⏭ Dev server not running — skipping smoke tests${NC}"
+        echo -e "  ${DIM}Run ./dvr dev up-d first${NC}"
+      fi
+      ;;
+    help|*)
+      echo "Usage: ./dvr test <command>"
+      echo ""
+      echo "  unit     Run vitest unit tests (in container)"
+      echo "  smoke    Smoke-test API (server must be running)"
+      echo "  all      Run everything (default)"
+      ;;
+  esac
+}
+
+cmd_logs() {
+  local service="${1:-}"
+  $DEV_COMPOSE logs -f $service
+}
+
+cmd_exec() {
+  local service="${1:-server}"
+  shift || true
+  local cmd="${*:-sh}"
+  echo -e "${YELLOW}▶ Exec into ${service}...${NC}"
+  docker exec -it "anywhereDVR-${service/server/dev}" $cmd
+}
+
+cmd_nuke() {
+  echo -e "${RED}▶ NUKE — Full clean slate${NC}"
+  echo "  This will destroy ALL containers, volumes, and images for AnywhereDVR."
+  echo ""
+  read -p "  Continue? [y/N] " -n 1 -r; echo
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "  Cancelled."
+    exit 0
+  fi
+
+  echo -e "${YELLOW}  Stopping dev stack...${NC}"
+  $DEV_COMPOSE down -v --rmi local 2>/dev/null || true
+
+  echo -e "${YELLOW}  Stopping prod stack...${NC}"
+  $PROD_COMPOSE down -v --rmi local 2>/dev/null || true
+
+  echo -e "${GREEN}  ✓ All containers, volumes, and local images removed.${NC}"
+  echo -e "  Run ${BLUE}./dvr dev up${NC} to rebuild from scratch."
+}
+
+# ─── Router ───────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  dev)     cmd_dev "$@" ;;
+  prod)    cmd_prod "$@" ;;
+  status)  cmd_status ;;
+  db)      cmd_db "$@" ;;
+  build)   cmd_build "$@" ;;
+  test)    cmd_test "$@" ;;
+  logs)    cmd_logs "$@" ;;
+  exec)    cmd_exec "$@" ;;
+  nuke)    cmd_nuke ;;
+  help|*)
+    echo -e "${BLUE}AnywhereDVR${NC} — Development CLI"
+    echo ""
+    echo "Usage: ./dvr <command> [subcommand]"
+    echo ""
+    echo "Commands:"
+    echo "  dev  [sub]       Dev stack: up up-d down restart rebuild"
+    echo "  prod [sub]       Prod stack: up down logs"
+    echo "  status           Show what's running"
+    echo "  db   [sub]       Database: start stop reset push migrate seed studio logs shell"
+    echo "  build [sub]      Build: server prod all check"
+    echo "  test  [sub]      Test: unit smoke all"
+    echo "  logs  [service]  Tail container logs"
+    echo "  exec  [service]  Shell into a container"
+    echo "  nuke             Destroy everything"
+    echo ""
+    echo "Examples:"
+    echo "  ./dvr dev              # Start dev stack (foreground)"
+    echo "  ./dvr dev up-d         # Start dev stack (background)"
+    echo "  ./dvr status           # What's running?"
+    echo "  ./dvr test smoke       # Hit the API endpoints"
+    echo "  ./dvr db shell         # Open psql"
+    echo "  ./dvr db reset         # Blow away DB"
+    echo "  ./dvr logs server      # Tail server logs"
+    echo "  ./dvr exec server      # Shell into server container"
+    echo "  ./dvr prod up          # Build + run production"
+    echo "  ./dvr build check      # Type-check in container"
+    echo "  ./dvr nuke             # Scorched earth"
+    ;;
+esac

@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+packages/server/dist/
+packages/web/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Prisma
+prisma/migrations/**/migration_lock.toml
+
+# Logs
+*.log
+logs/
+
+# Testing
+coverage/
+
+# Recordings (runtime data)
+recordings/
+
+# Temporary
+.tmp/

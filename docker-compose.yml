@@ -1,0 +1,43 @@
+# docker-compose.yml — Production stack
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: anywhereDVR-prod-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: anywhereDVR
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-anywhereDVR_prod}
+      POSTGRES_DB: anywhereDVR
+    volumes:
+      - pgdata-prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anywhereDVR"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    container_name: anywhereDVR
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://anywhereDVR:${DB_PASSWORD:-anywhereDVR_prod}@db:5432/anywhereDVR
+      - PORT=3000
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - RECORDINGS_PATH=/recordings
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - TZ=${TZ:-America/New_York}
+    volumes:
+      - ${RECORDINGS_HOST_PATH:-./recordings}:/recordings
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata-prod:

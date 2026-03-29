@@ -1,0 +1,48 @@
+# docker-compose.dev.yml — Development stack (db + server with hot reload)
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: anywhereDVR-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: anywhereDVR
+      POSTGRES_PASSWORD: anywhereDVR_dev
+      POSTGRES_DB: anywhereDVR
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anywhereDVR"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: anywhereDVR-dev
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:3000"
+    environment:
+      - DATABASE_URL=postgresql://anywhereDVR:anywhereDVR_dev@db:5432/anywhereDVR
+      - PORT=3000
+      - NODE_ENV=development
+      - LOG_LEVEL=debug
+      - RECORDINGS_PATH=/recordings
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - TZ=${TZ:-America/New_York}
+    volumes:
+      - ./packages:/app/packages
+      - ./prisma:/app/prisma
+      - recordings-dev:/recordings
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  recordings-dev:

@@ -1,0 +1,29 @@
+# Dockerfile.dev — Development image with hot reload
+# Source code is volume-mounted at runtime; only dependencies live in the image.
+
+FROM node:20-alpine
+
+# Install ffmpeg + OpenSSL (Prisma requires OpenSSL on Alpine)
+RUN apk add --no-cache ffmpeg openssl
+
+WORKDIR /app
+
+# Copy dependency manifests + workspace structure
+COPY package.json package-lock.json tsconfig.json ./
+COPY packages/server/package.json packages/server/tsconfig.json ./packages/server/
+COPY packages/web/package.json packages/web/tsconfig.json ./packages/web/
+COPY prisma/ ./prisma/
+
+# Install all dependencies (dev + prod)
+RUN npm ci
+
+# Generate Prisma client
+RUN npx prisma generate
+
+# Source code is volume-mounted at runtime — not copied here.
+# The volume mounts overlay: ./packages/ → /app/packages/ and ./prisma/ → /app/prisma/
+
+EXPOSE 3000
+
+# Sync schema + start server with hot reload
+CMD ["sh", "-c", "npx prisma db push --skip-generate && npx tsx watch packages/server/src/index.ts"]
