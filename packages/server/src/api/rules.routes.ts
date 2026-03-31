@@ -256,6 +256,90 @@ rulesRouter.put('/:id', async (req, res, next) => {
   }
 });
 
+// ── GET /api/v1/rules/:id/preview ──────────────────────────
+// Returns upcoming programs (next 14 days) that a SERIES rule would match.
+// Each program includes: id, title, subtitle, startTime, endTime, season,
+// episode, isNew, channelName, isScheduled (already has a recording).
+
+rulesRouter.get('/:id/preview', async (req, res, next) => {
+  try {
+    if (!uuidParamSchema.safeParse(req.params.id).success) {
+      res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid rule ID' },
+      });
+      return;
+    }
+
+    const rule = await db.recordingRule.findUnique({ where: { id: req.params.id } });
+    if (!rule) {
+      res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Recording rule not found' },
+      });
+      return;
+    }
+
+    if (rule.type !== 'SERIES' || !rule.seriesTitle) {
+      res.json({ data: [] });
+      return;
+    }
+
+    const now = new Date();
+    const lookahead = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+
+    const where: Record<string, unknown> = {
+      title: { contains: rule.seriesTitle, mode: 'insensitive' },
+      startTime: { gte: now, lte: lookahead },
+    };
+
+    if (rule.channelId) {
+      where['channelId'] = rule.channelId;
+    }
+
+    if (rule.newOnly === 'NEW_ONLY') {
+      where['isNew'] = true;
+    }
+
+    const programs = await db.program.findMany({
+      where,
+      orderBy: { startTime: 'asc' },
+      include: { channel: { select: { id: true, name: true, tvgLogo: true } } },
+    });
+
+    if (programs.length === 0) {
+      res.json({ data: [] });
+      return;
+    }
+
+    // Annotate with existing recording status
+    const programIds = programs.map((p) => p.id);
+    const existingRecordings = await db.recording.findMany({
+      where: {
+        programId: { in: programIds },
+        status: { in: ['SCHEDULED', 'RECORDING', 'POST_PROCESSING', 'COMPLETED', 'CANCELLED', 'FAILED'] },
+      },
+      select: { programId: true, status: true },
+    });
+    const recordingByProgramId = new Map(existingRecordings.map((r) => [r.programId, r.status]));
+
+    const data = programs.map((p) => ({
+      id: p.id,
+      title: p.title,
+      subtitle: p.subtitle,
+      startTime: p.startTime.toISOString(),
+      endTime: p.endTime.toISOString(),
+      season: p.season,
+      episode: p.episode,
+      isNew: p.isNew,
+      channel: p.channel,
+      recordingStatus: recordingByProgramId.get(p.id) ?? null,
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── DELETE /api/v1/rules/:id ────────────────────────────────
 
 rulesRouter.delete('/:id', async (req, res, next) => {

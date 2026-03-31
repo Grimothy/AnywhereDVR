@@ -11,7 +11,7 @@ import Channels from './pages/Channels.tsx'
 import Search from './pages/Search.tsx'
 import Recordings from './pages/Recordings.tsx'
 import Schedule from './pages/Schedule.tsx'
-import SeasonPasses from './pages/SeasonPasses.tsx'
+import SeriesPasses from './pages/SeasonPasses.tsx'
 import Status from './pages/Status.tsx'
 import Settings from './pages/Settings.tsx'
 
@@ -59,7 +59,7 @@ function AppRoutes() {
         {/* Admin-only routes */}
         {isAdmin && (
           <>
-            <Route path="/passes" element={<SeasonPasses />} />
+            <Route path="/passes" element={<SeriesPasses />} />
             <Route path="/status" element={<Status />} />
             <Route path="/settings" element={<Settings />} />
           </>

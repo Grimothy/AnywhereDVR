@@ -251,6 +251,24 @@ export async function deleteRule(id: string): Promise<void> {
   await api.delete(`/rules/${id}`)
 }
 
+export interface RulePreviewProgram {
+  id: string
+  title: string
+  subtitle?: string | null
+  startTime: string
+  endTime: string
+  season?: number | null
+  episode?: number | null
+  isNew: boolean
+  channel: { id: string; name: string; tvgLogo?: string | null }
+  recordingStatus: string | null
+}
+
+export async function getRulePreview(id: string): Promise<RulePreviewProgram[]> {
+  const response = await api.get(`/rules/${id}/preview`)
+  return response.data.data
+}
+
 export async function getRecordings(params?: {
   status?: string
   title?: string
@@ -275,6 +293,21 @@ export async function getUpcomingSchedule(): Promise<Recording[]> {
   return response.data.data
 }
 
+// ── Image proxy ──────────────────────────────────────────────
+//
+// Routes all external image URLs through the server-side proxy so that:
+//  - CORS issues are eliminated (images served from same origin)
+//  - Dead URLs (HTTP 204, empty body, etc.) return a proper 404 so
+//    the browser fires onError and the fallback chain works correctly
+//
+export function proxyImageUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  // Already proxied or a relative URL — pass through
+  if (url.startsWith('/api/v1/proxy/') || url.startsWith('/')) return url
+  const encoded = btoa(url).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return `/api/v1/proxy/image?url=${encoded}`
+}
+
 // Export types
 export type {
   Source,
@@ -294,6 +327,7 @@ export interface AppSettings {
   startEarlySeconds?: string
   endLateSeconds?: string
   epgRefreshIntervalHours?: string
+  epgDaysAhead?: string
   sourceRefreshIntervalHours?: string
   enableComskip?: string
   enableTmdbEnrichment?: string

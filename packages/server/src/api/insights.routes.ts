@@ -180,10 +180,10 @@ insightsRouter.get('/', async (_req, res, next) => {
       const originalTitle = allCompleted.find((r) => r.title.toLowerCase() === titleKey)?.title ?? titleKey;
       suggestions.push({
         type: 'NO_PASS',
-        title: `Add a Season Pass for "${originalTitle}"`,
-        body: `You've recorded it ${count} times manually. A Season Pass will catch every episode automatically.`,
+        title: `Add a Series Pass for "${originalTitle}"`,
+        body: `You've recorded it ${count} times manually. A Series Pass will catch every episode automatically.`,
         severity: 'tip',
-        action: 'season-pass',
+        action: 'series-pass',
         actionTarget: originalTitle,
       });
     }
@@ -208,7 +208,7 @@ insightsRouter.get('/', async (_req, res, next) => {
       suggestions.push({
         type: 'STALE_PASS',
         title: `"${rule.seriesTitle}" hasn't recorded in 30 days`,
-        body: `The Season Pass is enabled but nothing has been recorded. The show may be on hiatus or the EPG title may have changed.`,
+        body: `The Series Pass is enabled but nothing has been recorded. The show may be on hiatus or the EPG title may have changed.`,
         severity: 'warning',
         action: 'view-pass',
         actionTarget: rule.id,

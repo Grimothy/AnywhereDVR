@@ -19,7 +19,7 @@ export default function Guide() {
     setSelectedProgram(program)
     setSelectedChannelId(channelId)
 
-    // Load rules once to check for existing season passes
+    // Load rules once to check for existing series passes
     if (!rulesLoaded) {
       try {
         const rules = await getRules()

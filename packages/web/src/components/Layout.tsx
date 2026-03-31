@@ -119,7 +119,7 @@ export default function Layout({ children }: LayoutProps) {
     { path: '/search', label: 'Search', Icon: IconSearch },
     { path: '/recordings', label: 'Recordings', Icon: IconRecordings },
     { path: '/schedule', label: 'Schedule', Icon: IconSchedule },
-    { path: '/passes', label: 'Season Passes', Icon: IconPasses },
+    { path: '/passes', label: 'Series Passes', Icon: IconPasses },
     { path: '/status', label: 'Status', Icon: IconStatus },
     { path: '/settings', label: 'Settings', Icon: IconSettings },
   ]
@@ -294,7 +294,7 @@ function getPageTitle(pathname: string): string {
     '/dashboard': 'Dashboard',
     '/recordings': 'Recordings',
     '/schedule': 'Schedule',
-    '/passes': 'Season Passes',
+    '/passes': 'Series Passes',
     '/status': 'System Status',
     '/settings': 'Settings',
   }
