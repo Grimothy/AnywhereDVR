@@ -8,6 +8,11 @@
  * - GET /live.m3u      — Live buffer playlist of in-progress recordings
  * - GET /recordings/:id/stream.m3u8 — HLS index for a specific recording
  * - GET /recordings/:id/segment_*.ts — Individual HLS segment file
+ *
+ * Auth:
+ * - If ?token=<playlistToken> is provided, validates against User.playlistToken
+ * - If user.requireToken is false, the playlist is publicly accessible
+ * - HLS segment/stream serving is always public (URLs are opaque UUIDs)
  */
 
 import { Router } from 'express';
@@ -18,6 +23,8 @@ import { z } from 'zod';
 import { db } from '../db.js';
 import { logger } from '../logger.js';
 import { config } from '../config.js';
+import { verifyToken, COOKIE_NAME } from '../auth/jwt.js';
+import type { Request, Response, NextFunction } from 'express';
 
 export const m3uOutputRouter = Router();
 
@@ -75,11 +82,91 @@ function isPathSafe(filePath: string): boolean {
   return resolvedPath.startsWith(allowedBase + sep) || resolvedPath === allowedBase;
 }
 
+// ── Playlist auth helper ─────────────────────────────────────
+// Resolves the requesting user from ?token= query param or JWT cookie.
+// Returns null if no valid identity found (public access permitted unless requireToken).
+
+interface PlaylistIdentity {
+  userId: string;
+  role: 'ADMIN' | 'USER';
+  assignedGroups: string[];
+  requireToken: boolean;
+}
+
+async function resolvePlaylistIdentity(req: Request): Promise<PlaylistIdentity | null> {
+  // 1. Try ?token= query param (for external media players)
+  const queryToken = req.query.token as string | undefined;
+  if (queryToken) {
+    const user = await db.user.findUnique({ where: { playlistToken: queryToken } });
+    if (user && user.isActive) {
+      return {
+        userId: user.id,
+        role: user.role,
+        assignedGroups: user.assignedGroups,
+        requireToken: user.requireToken,
+      };
+    }
+    return null; // invalid token
+  }
+
+  // 2. Try JWT cookie (for web app)
+  const jwtToken = req.cookies?.[COOKIE_NAME] as string | undefined;
+  if (jwtToken) {
+    const payload = verifyToken(jwtToken);
+    if (payload) {
+      const user = await db.user.findUnique({ where: { id: payload.sub } });
+      if (user && user.isActive) {
+        return {
+          userId: user.id,
+          role: user.role,
+          assignedGroups: user.assignedGroups,
+          requireToken: user.requireToken,
+        };
+      }
+    }
+  }
+
+  return null; // unauthenticated
+}
+
+// ── Playlist access guard ────────────────────────────────────
+// Middleware that checks if the playlist endpoint requires a token.
+// Admin and token-holders always get through; unauthenticated users are blocked
+// if ANY user has requireToken=true (global policy) OR if no users exist yet.
+
+async function requirePlaylistAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const identity = await resolvePlaylistIdentity(req);
+
+    if (!identity) {
+      // Check if global auth is required — if any user exists with requireToken, enforce
+      const needsToken = await db.user.count({ where: { requireToken: true } });
+      if (needsToken > 0) {
+        res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Playlist token required' } });
+        return;
+      }
+      // Open access — proceed without attaching identity
+      next();
+      return;
+    }
+
+    // Attach identity to req for downstream use
+    (req as Request & { playlistIdentity?: PlaylistIdentity }).playlistIdentity = identity;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── GET /vod.m3u ────────────────────────────────────────────
 
-m3uOutputRouter.get('/vod.m3u', async (req, res, next) => {
+m3uOutputRouter.get('/vod.m3u', requirePlaylistAuth, async (req, res, next) => {
   try {
-    const cached = getCached('vod');
+    const identity = (req as Request & { playlistIdentity?: PlaylistIdentity }).playlistIdentity;
+
+    // Build cache key based on user identity so each user gets their own filtered playlist
+    const cacheKey = identity ? `vod:${identity.userId}` : 'vod:public';
+    const cached = getCached(cacheKey);
     if (cached) {
       res.set('Content-Type', 'audio/x-mpegurl');
       res.send(cached);
@@ -90,14 +177,22 @@ m3uOutputRouter.get('/vod.m3u', async (req, res, next) => {
       where: { status: 'COMPLETED' },
       orderBy: [{ title: 'asc' }, { scheduledStart: 'asc' }],
       include: {
-        channel: { select: { name: true, tvgLogo: true } },
+        channel: { select: { name: true, tvgLogo: true, groupTitle: true } },
       },
     });
+
+    // Filter by user's assigned groups if not admin
+    const filtered = (identity && identity.role !== 'ADMIN' && identity.assignedGroups.length > 0)
+      ? recordings.filter(rec => {
+          const group = rec.channel?.groupTitle ?? '';
+          return identity.assignedGroups.includes(group);
+        })
+      : recordings;
 
     const baseUrl = getBaseUrl(req);
     let m3u = '#EXTM3U\n';
 
-    for (const rec of recordings) {
+    for (const rec of filtered) {
       const episodeTag = formatEpisodeTag(rec.season, rec.episode);
       const displayName = rec.subtitle
         ? `${rec.title}${episodeTag} - ${rec.subtitle}`
@@ -117,7 +212,7 @@ m3uOutputRouter.get('/vod.m3u', async (req, res, next) => {
       m3u += `${baseUrl}/recordings/${rec.id}/stream.m3u8\n`;
     }
 
-    setCache('vod', m3u);
+    setCache(cacheKey, m3u);
 
     res.set('Content-Type', 'audio/x-mpegurl');
     res.send(m3u);
@@ -128,9 +223,12 @@ m3uOutputRouter.get('/vod.m3u', async (req, res, next) => {
 
 // ── GET /live.m3u ───────────────────────────────────────────
 
-m3uOutputRouter.get('/live.m3u', async (req, res, next) => {
+m3uOutputRouter.get('/live.m3u', requirePlaylistAuth, async (req, res, next) => {
   try {
-    const cached = getCached('live');
+    const identity = (req as Request & { playlistIdentity?: PlaylistIdentity }).playlistIdentity;
+    const cacheKey = identity ? `live:${identity.userId}` : 'live:public';
+
+    const cached = getCached(cacheKey);
     if (cached) {
       res.set('Content-Type', 'audio/x-mpegurl');
       res.send(cached);
@@ -141,14 +239,22 @@ m3uOutputRouter.get('/live.m3u', async (req, res, next) => {
       where: { status: 'RECORDING' },
       orderBy: { actualStart: 'asc' },
       include: {
-        channel: { select: { name: true, tvgLogo: true } },
+        channel: { select: { name: true, tvgLogo: true, groupTitle: true } },
       },
     });
+
+    // Filter by user's assigned groups if not admin
+    const filtered = (identity && identity.role !== 'ADMIN' && identity.assignedGroups.length > 0)
+      ? recordings.filter(rec => {
+          const group = rec.channel?.groupTitle ?? '';
+          return identity.assignedGroups.includes(group);
+        })
+      : recordings;
 
     const baseUrl = getBaseUrl(req);
     let m3u = '#EXTM3U\n';
 
-    for (const rec of recordings) {
+    for (const rec of filtered) {
       m3u += `#EXTINF:-1`;
       m3u += ` tvg-id="${rec.id}"`;
       m3u += ` tvg-name="${rec.title}"`;
@@ -158,7 +264,7 @@ m3uOutputRouter.get('/live.m3u', async (req, res, next) => {
       m3u += `${baseUrl}/recordings/${rec.id}/stream.m3u8\n`;
     }
 
-    setCache('live', m3u);
+    setCache(cacheKey, m3u);
 
     res.set('Content-Type', 'audio/x-mpegurl');
     res.send(m3u);
@@ -252,6 +358,61 @@ m3uOutputRouter.get('/recordings/:id/stream.m3u8', async (req, res, next) => {
   }
 });
 
+// ── GET /recordings/:id/file.ts ─────────────────────────────
+// Serve the completed single-file recording
+// IMPORTANT: Must be registered BEFORE /:segment wildcard to avoid being shadowed
+
+m3uOutputRouter.get('/recordings/:id/file.ts', async (req, res, next) => {
+  try {
+    // Validate UUID
+    if (!uuidParamSchema.safeParse(req.params.id).success) {
+      res.status(400).json({
+        error: { code: 'VALIDATION_ERROR', message: 'Invalid recording ID' },
+      });
+      return;
+    }
+
+    const recording = await db.recording.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!recording || !recording.filePath) {
+      res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Recording file not found' },
+      });
+      return;
+    }
+
+    const filePath = recording.filePath.startsWith('/')
+      ? recording.filePath
+      : join(config.recordingsPath, recording.filePath);
+
+    // Security: verify resolved path stays within recordings directory
+    if (!isPathSafe(filePath)) {
+      logger.warn({ recordingId: req.params.id, filePath }, 'Path traversal attempt detected');
+      res.status(403).json({
+        error: { code: 'FORBIDDEN', message: 'Access denied' },
+      });
+      return;
+    }
+
+    try {
+      const fileStat = await stat(filePath);
+      res.set('Content-Type', 'video/mp2t');
+      res.set('Content-Length', String(fileStat.size));
+      res.set('Accept-Ranges', 'bytes');
+      createReadStream(filePath).pipe(res);
+    } catch (err) {
+      logger.debug({ recordingId: req.params.id, filePath, err }, 'Recording file not found on disk');
+      res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Recording file not found on disk' },
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── GET /recordings/:id/segment_*.ts ────────────────────────
 
 m3uOutputRouter.get('/recordings/:id/:segment', async (req, res, next) => {
@@ -307,60 +468,6 @@ m3uOutputRouter.get('/recordings/:id/:segment', async (req, res, next) => {
     } catch {
       res.status(404).json({
         error: { code: 'NOT_FOUND', message: 'Segment not found' },
-      });
-    }
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ── GET /recordings/:id/file.ts ─────────────────────────────
-// Serve the completed single-file recording
-
-m3uOutputRouter.get('/recordings/:id/file.ts', async (req, res, next) => {
-  try {
-    // Validate UUID
-    if (!uuidParamSchema.safeParse(req.params.id).success) {
-      res.status(400).json({
-        error: { code: 'VALIDATION_ERROR', message: 'Invalid recording ID' },
-      });
-      return;
-    }
-
-    const recording = await db.recording.findUnique({
-      where: { id: req.params.id },
-    });
-
-    if (!recording || !recording.filePath) {
-      res.status(404).json({
-        error: { code: 'NOT_FOUND', message: 'Recording file not found' },
-      });
-      return;
-    }
-
-    const filePath = recording.filePath.startsWith('/')
-      ? recording.filePath
-      : join(config.recordingsPath, recording.filePath);
-
-    // Security: verify resolved path stays within recordings directory
-    if (!isPathSafe(filePath)) {
-      logger.warn({ recordingId: req.params.id, filePath }, 'Path traversal attempt detected');
-      res.status(403).json({
-        error: { code: 'FORBIDDEN', message: 'Access denied' },
-      });
-      return;
-    }
-
-    try {
-      const fileStat = await stat(filePath);
-      res.set('Content-Type', 'video/mp2t');
-      res.set('Content-Length', String(fileStat.size));
-      res.set('Accept-Ranges', 'bytes');
-      createReadStream(filePath).pipe(res);
-    } catch (err) {
-      logger.debug({ recordingId: req.params.id, filePath, err }, 'Recording file not found on disk');
-      res.status(404).json({
-        error: { code: 'NOT_FOUND', message: 'Recording file not found on disk' },
       });
     }
   } catch (err) {

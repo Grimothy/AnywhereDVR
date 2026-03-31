@@ -2,12 +2,16 @@
 
 import { spawn } from 'node:child_process';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { db } from '../db.js';
 import { logger } from '../logger.js';
+import { config } from '../config.js';
 import { getRecordingSettings } from '../types/recording.js';
 import { buildRecordingPath } from './file-namer.js';
+import { comskipRunner } from './comskip-runner.js';
+import { getTmdbClient } from './tmdb-client.js';
 import { invalidateM3uCache } from '../api/m3u-output.routes.js';
+import { notificationManager } from './notification-manager.js';
 
 /**
  * PostProcessor — Runs after ffmpeg stops.
@@ -15,8 +19,8 @@ import { invalidateM3uCache } from '../api/m3u-output.routes.js';
  * Pipeline (per spec section 9.6):
  *   Step 1 (FATAL)     — Concatenate HLS segments → single .ts file, measure duration
  *   Step 2 (non-fatal) — Smart rename into library/ directory
- *   Step 3 (non-fatal) — Comskip (Phase 6 — skipped, marked as 'skipped')
- *   Step 4 (non-fatal) — TMDB enrichment (Phase 6 — skipped if no API key)
+ *   Step 3 (non-fatal) — Comskip commercial detection
+ *   Step 4 (non-fatal) — TMDB enrichment (skipped if no API key)
  *   Step 5 (non-fatal) — Write sidecar .json
  *   Step 6             — Cleanup live/ temp dir, update DB to COMPLETED
  */
@@ -27,6 +31,9 @@ export class PostProcessor {
    */
   async run(recordingId: string): Promise<void> {
     logger.info({ recordingId }, 'Post-processing started');
+
+    // Notify UI that post-processing has begun
+    notificationManager.socketEmit('recording:post_processing', { recordingId });
 
     const recording = await db.recording.findUnique({
       where: { id: recordingId },
@@ -127,25 +134,69 @@ export class PostProcessor {
       logger.warn({ recordingId, err }, 'Step 2 failed: could not update filePath in DB');
     }
 
-    // ── Step 3: Comskip (Phase 6 — mark skipped) ────────────────────────────
+    // ── Step 3: Comskip commercial detection (non-fatal) ────────────────────
+    let commercials: Array<{ start: number; end: number }> = [];
     try {
+      const comskipResult = await comskipRunner.run(outputPath);
+
+      const relativeEdlPath = comskipResult.edlPath &&
+        comskipResult.edlPath.startsWith(settings.recordingsBasePath)
+        ? comskipResult.edlPath.slice(settings.recordingsBasePath.length).replace(/^\//, '')
+        : comskipResult.edlPath;
+
       await db.recording.update({
         where: { id: recordingId },
-        data: { comskipStatus: 'skipped' },
+        data: {
+          comskipStatus: comskipResult.status,
+          edlPath: relativeEdlPath,
+        },
       });
+
+      commercials = comskipResult.commercials;
+      logger.info(
+        { recordingId, comskipStatus: comskipResult.status, commercialCount: commercials.length },
+        'Step 3 complete: comskip',
+      );
     } catch (err) {
-      logger.debug({ recordingId, err }, 'Step 3: comskip status update skipped');
+      logger.warn({ recordingId, err }, 'Step 3 failed: comskip error — continuing');
+      try {
+        await db.recording.update({ where: { id: recordingId }, data: { comskipStatus: 'failed' } });
+      } catch { /* ignore secondary failure */ }
     }
 
-    // ── Step 4: TMDB enrichment (Phase 6 — skip if no API key) ──────────────
-    // TMDB enrichment deferred to Phase 6 (requires external API key).
-    // Graceful skip — recording still completes without it.
+    // ── Step 4: TMDB enrichment (non-fatal, skip if no API key) ─────────────
+    try {
+      const tmdb = getTmdbClient(config.tmdbApiKey);
+      const match = await tmdb.enrich(recording.title, recording.season, recording.episode);
+
+      if (match) {
+        await db.recording.update({
+          where: { id: recordingId },
+          data: {
+            tmdbId: match.tmdbId,
+            posterUrl: match.posterUrl,
+            backdropUrl: match.backdropUrl,
+          },
+        });
+        logger.info({ recordingId, tmdbId: match.tmdbId }, 'Step 4 complete: TMDB enrichment');
+      } else {
+        logger.debug({ recordingId, title: recording.title }, 'Step 4: no TMDB match found — skipping');
+      }
+    } catch (err) {
+      logger.warn({ recordingId, err }, 'Step 4 failed: TMDB enrichment error — continuing');
+    }
+
+    // Re-fetch recording to get latest TMDB data for sidecar
+    const finalRecording = await db.recording.findUnique({
+      where: { id: recordingId },
+      include: { channel: { select: { name: true, tvgId: true } } },
+    }) ?? recording;
 
     // ── Step 5: Write sidecar .json (non-fatal) ──────────────────────────────
     let sidecarPath: string | null = null;
     try {
       sidecarPath = outputPath.replace(/\.ts$/, '.json');
-      const sidecar = buildSidecar(recording, duration);
+      const sidecar = buildSidecar(finalRecording, duration, commercials);
       await writeFile(sidecarPath, JSON.stringify(sidecar, null, 2), 'utf-8');
       logger.info({ recordingId, sidecarPath }, 'Step 5 complete: sidecar JSON written');
     } catch (err) {
@@ -183,6 +234,9 @@ export class PostProcessor {
 
       // Invalidate M3U cache so /vod.m3u reflects the new recording
       invalidateM3uCache();
+
+      // Notify UI that recording is fully processed and ready to play
+      notificationManager.socketEmit('recording:completed', { recordingId });
 
       logger.info({ recordingId, relativeFilePath }, 'Post-processing complete — recording COMPLETED');
     } catch (err) {
@@ -248,6 +302,7 @@ function buildSidecar(
     channel: { name: string; tvgId: string | null } | null;
   },
   duration: number | null,
+  commercials: Array<{ start: number; end: number }>,
 ): Record<string, unknown> {
   return {
     title: recording.title,
@@ -263,7 +318,7 @@ function buildSidecar(
     posterUrl: recording.posterUrl ?? null,
     backdropUrl: recording.backdropUrl ?? null,
     tmdbId: recording.tmdbId ?? null,
-    commercials: [], // Populated by comskip in Phase 6
+    commercials,
   };
 }
 

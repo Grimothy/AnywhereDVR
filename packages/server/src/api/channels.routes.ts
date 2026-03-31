@@ -8,7 +8,7 @@ export const channelsRouter = Router();
 
 const listQuerySchema = z.object({
   sourceId: z.string().uuid().optional(),
-  group: z.string().optional(),
+  groupTitle: z.string().optional(),
   search: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),
   perPage: z.coerce.number().int().min(1).max(200).default(50),
@@ -30,12 +30,12 @@ channelsRouter.get('/', async (req, res, next) => {
       return;
     }
 
-    const { sourceId, group, search, page, perPage } = parsed.data;
+    const { sourceId, groupTitle, search, page, perPage } = parsed.data;
 
     // Build where clause
     const where: Record<string, unknown> = { isActive: true };
     if (sourceId) where.sourceId = sourceId;
-    if (group) where.groupTitle = group;
+    if (groupTitle) where.groupTitle = groupTitle;
     if (search) {
       where.name = { contains: search, mode: 'insensitive' };
     }
@@ -126,20 +126,22 @@ channelsRouter.get('/:id', async (req, res, next) => {
 
 channelsRouter.get('/groups/list', async (_req, res, next) => {
   try {
-    const groups = await db.channel.findMany({
+    // Aggregate channel count per group, excluding null groups
+    const groups = await db.channel.groupBy({
+      by: ['groupTitle'],
       where: {
         isActive: true,
         groupTitle: { not: null },
       },
-      select: { groupTitle: true },
-      distinct: ['groupTitle'],
+      _count: { id: true },
       orderBy: { groupTitle: 'asc' },
     });
 
     res.json({
-      data: groups
-        .map((g) => g.groupTitle)
-        .filter((g): g is string => g !== null),
+      data: groups.map((g) => ({
+        name: g.groupTitle,
+        count: g._count.id,
+      })),
     });
   } catch (err) {
     next(err);

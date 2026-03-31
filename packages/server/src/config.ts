@@ -15,6 +15,7 @@ const configSchema = z.object({
   recordingsPath: z.string().default('/recordings'),
   tmdbApiKey: z.string().default(''),
   tz: z.string().default('America/New_York'),
+  jwtSecret: z.string().min(16).default('anywhereDVR-dev-secret-change-in-prod'),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -27,4 +28,5 @@ export const config: Config = configSchema.parse({
   recordingsPath: process.env.RECORDINGS_PATH,
   tmdbApiKey: process.env.TMDB_API_KEY,
   tz: process.env.TZ,
+  jwtSecret: process.env.JWT_SECRET,
 });

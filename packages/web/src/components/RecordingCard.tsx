@@ -35,24 +35,22 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
     })
   }
 
-  const getStatusBadge = (status: Recording['status']) => {
-    const baseClasses = 'inline-flex items-center px-2 py-1 rounded text-xs font-medium border'
-    
+  const getStatusInfo = (status: Recording['status']): { classes: string; label: string } => {
     switch (status) {
       case 'RECORDING':
-        return `${baseClasses} bg-red-900 text-red-300 border-red-700 animate-pulse`
+        return { classes: 'bg-rust/20 text-rust border-rust/40 animate-pulse', label: 'Recording' }
       case 'POST_PROCESSING':
-        return `${baseClasses} bg-yellow-900 text-yellow-300 border-yellow-700`
+        return { classes: 'bg-gold/20 text-gold border-gold/40 animate-pulse', label: 'Processing' }
       case 'COMPLETED':
-        return `${baseClasses} bg-green-900 text-green-300 border-green-700`
+        return { classes: 'bg-teal/20 text-teal border-teal/40', label: 'Completed' }
       case 'FAILED':
-        return `${baseClasses} bg-red-950 text-red-400 border-red-800`
+        return { classes: 'bg-rust/20 text-rust border-rust/40', label: 'Failed' }
       case 'SCHEDULED':
-        return `${baseClasses} bg-blue-900 text-blue-300 border-blue-700`
+        return { classes: 'bg-navy-600 text-white/60 border-navy-500', label: 'Scheduled' }
       case 'CANCELLED':
-        return `${baseClasses} bg-gray-900 text-gray-400 border-gray-700`
+        return { classes: 'bg-navy-700 text-navy-400 border-navy-600', label: 'Cancelled' }
       default:
-        return `${baseClasses} bg-gray-900 text-gray-400 border-gray-700`
+        return { classes: 'bg-navy-700 text-navy-400 border-navy-600', label: status }
     }
   }
 
@@ -72,52 +70,57 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
     }
   }
 
+  const statusInfo = getStatusInfo(recording.status)
+
   return (
-    <div className="bg-surface-50 border border-border rounded-lg p-4 hover:border-amber-500/20 transition-colors">
+    <div className="bg-navy-800 border border-navy-600 rounded-xl p-4 shadow-card hover:shadow-card-hover hover:border-gold/30 transition-all">
       {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div className="flex-1">
-          <h3 className="font-semibold text-gray-100 mb-1">
+          <h3 className="font-semibold text-white font-display mb-1">
             {recording.title}
           </h3>
           {recording.subtitle && (
-            <p className="text-amber-500 text-sm font-medium mb-1">
+            <p className="text-gold text-sm font-medium mb-1">
               {recording.subtitle}
             </p>
           )}
-          <div className="flex items-center gap-2 mb-2">
-            <span className={getStatusBadge(recording.status)}>
-              {recording.status.replace('_', ' ')}
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
+            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${statusInfo.classes}`}>
+              {statusInfo.label}
             </span>
             {formatEpisode() && (
-              <span className="font-mono text-xs text-gray-400">
+              <span className="font-mono text-xs text-navy-400">
                 {formatEpisode()}
               </span>
             )}
           </div>
+          {recording.status === 'POST_PROCESSING' && (
+            <p className="text-gold/60 text-xs mb-1">Concatenating segments — will be ready shortly</p>
+          )}
         </div>
       </div>
 
       {/* Description */}
       {recording.description && (
-        <p className="text-gray-400 text-sm mb-3 line-clamp-2">
+        <p className="text-white/50 text-sm mb-3 line-clamp-2">
           {recording.description}
         </p>
       )}
 
       {/* Metadata */}
-      <div className="flex items-center justify-between text-sm text-gray-400 mb-3">
-        <div className="flex items-center gap-4">
-          <span className="font-mono">
+      <div className="flex items-center justify-between text-sm text-navy-400 mb-3">
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-xs">
             {formatDate(recording.scheduledStart)}
           </span>
           {recording.category && (
-            <span>{recording.category}</span>
+            <span className="text-xs">{recording.category}</span>
           )}
         </div>
-        <div className="flex items-center gap-4">
-          <span className="font-mono">{formatFileSize(recording.fileSize)}</span>
-          <span className="font-mono">{formatDuration(recording.duration)}</span>
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-xs">{formatFileSize(recording.fileSize)}</span>
+          <span className="font-mono text-xs">{formatDuration(recording.duration)}</span>
         </div>
       </div>
 
@@ -127,7 +130,7 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
           {recording.status === 'COMPLETED' && recording.filePath && (
             <a
               href={`/recordings/${recording.id}/stream.m3u8`}
-              className="inline-flex items-center px-3 py-1 bg-amber-500 hover:bg-amber-600 text-black font-semibold rounded text-sm transition-colors"
+              className="inline-flex items-center px-3 py-1.5 bg-gold hover:bg-gold-muted text-navy font-semibold rounded text-sm transition-colors"
               target="_blank"
               rel="noopener noreferrer"
             >
@@ -135,13 +138,13 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
             </a>
           )}
         </div>
-        <div>
+        <div className="flex items-center gap-2">
           <button
             onClick={handleDelete}
-            className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+            className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
               showDeleteConfirm
-                ? 'bg-red-900 hover:bg-red-800 text-red-200'
-                : 'bg-red-900/50 hover:bg-red-900 text-red-400 hover:text-red-200'
+                ? 'bg-rust text-white'
+                : 'bg-rust/10 hover:bg-rust/20 text-rust border border-rust/30'
             }`}
           >
             {showDeleteConfirm ? 'Confirm Delete' : 'Delete'}
@@ -149,7 +152,7 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
           {showDeleteConfirm && (
             <button
               onClick={() => setShowDeleteConfirm(false)}
-              className="ml-2 px-3 py-1 bg-surface-100 hover:bg-surface-200 border border-border rounded text-sm"
+              className="px-3 py-1.5 bg-navy-700 hover:bg-navy-600 border border-navy-500 rounded text-sm text-white"
             >
               Cancel
             </button>
@@ -159,7 +162,7 @@ export default function RecordingCard({ recording, onDelete }: RecordingCardProp
 
       {/* Error message */}
       {recording.status === 'FAILED' && recording.errorMessage && (
-        <div className="mt-3 p-2 bg-red-950/50 border border-red-800 rounded text-sm text-red-300">
+        <div className="mt-3 p-2 bg-rust/10 border border-rust/30 rounded text-sm text-rust">
           <span className="font-medium">Error:</span> {recording.errorMessage}
         </div>
       )}

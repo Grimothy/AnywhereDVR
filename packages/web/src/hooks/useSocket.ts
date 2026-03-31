@@ -1,30 +1,50 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { io, Socket } from 'socket.io-client'
 
-export function useSocket() {
-  const socketRef = useRef<Socket | null>(null)
-  
+// Singleton socket — created once, shared across all hook consumers
+let _socket: Socket | null = null
+
+function getSocket(): Socket {
+  if (!_socket) {
+    _socket = io('/', { path: '/socket.io' })
+  }
+  return _socket
+}
+
+export function useSocket(): Socket {
+  const [, forceRender] = useState(0)
+  const socketRef = useRef<Socket>(getSocket())
+
   useEffect(() => {
-    socketRef.current = io('/', { path: '/socket.io' })
-    
-    return () => {
-      socketRef.current?.disconnect()
+    const socket = getSocket()
+    socketRef.current = socket
+
+    if (!socket.connected) {
+      // Force a re-render once connected so consumers see a live socket
+      const onConnect = () => forceRender((n) => n + 1)
+      socket.once('connect', onConnect)
+      return () => {
+        socket.off('connect', onConnect)
+      }
     }
   }, [])
-  
+
   return socketRef.current
 }
 
-export function useSocketEvent(event: string, handler: (data: any) => void) {
+export function useSocketEvent<T = unknown>(
+  event: string,
+  handler: (data: T) => void,
+) {
   const socket = useSocket()
-  
+  const handlerRef = useRef(handler)
+  handlerRef.current = handler
+
   useEffect(() => {
-    if (!socket) return
-    
-    socket.on(event, handler)
-    
+    const stable = (data: T) => handlerRef.current(data)
+    socket.on(event, stable)
     return () => {
-      socket.off(event, handler)
+      socket.off(event, stable)
     }
-  }, [socket, event, handler])
+  }, [socket, event])
 }

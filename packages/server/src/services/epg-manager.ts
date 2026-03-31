@@ -5,6 +5,7 @@ import { db } from '../db.js';
 import { logger } from '../logger.js';
 import { parseXmltv } from './xmltv-parser.js';
 import { ParsedProgram } from '../types/epg.js';
+import { metadataEnricher } from './metadata-enricher.js';
 
 /**
  * EPG Manager
@@ -89,6 +90,12 @@ export class EpgManager {
     await this.purgeOldPrograms(source.channels.map(ch => ch.id));
 
     logger.info({ sourceId, stored }, 'EPG refresh complete for source');
+
+    // Fire-and-forget metadata enrichment for unique show titles
+    const uniqueTitles = [...new Set(programs.map(p => p.title))];
+    metadataEnricher.enrichTitlesInBackground(uniqueTitles).catch(err => {
+      logger.warn({ err, sourceId }, 'Background metadata enrichment failed');
+    });
   }
 
   /**

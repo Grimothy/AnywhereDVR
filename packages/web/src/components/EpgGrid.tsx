@@ -1,104 +1,143 @@
-import { useState, useEffect, useMemo } from 'react'
-import { getChannels, Channel } from '../api/client.ts'
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import { getChannels, getGroups, Channel, ChannelGroup } from '../api/client.ts'
 import { useEpg } from '../hooks/useEpg.ts'
 import { Program } from '../api/client.ts'
 
 interface EpgGridProps {
   onProgramSelect?: (program: Program, channelId: string) => void
+  onChannelClick?: (channelId: string) => void
+  selectedProgramId?: string | null
 }
 
-export default function EpgGrid({ onProgramSelect }: EpgGridProps) {
+const WINDOW_HOURS = 8
+const SLOT_MINUTES = 30
+const PIXELS_PER_SLOT = 88
+const CHANNEL_COLUMN_WIDTH = 220
+
+export default function EpgGrid({ onProgramSelect, onChannelClick, selectedProgramId }: EpgGridProps) {
   const [channels, setChannels] = useState<Channel[]>([])
   const [channelsLoading, setChannelsLoading] = useState(true)
-  const [selectedProgram, setSelectedProgram] = useState<Program | null>(null)
-  const [currentWindowStart, setCurrentWindowStart] = useState(() => {
-    // Start at current time, rounded to nearest 30 minutes
+  const [groups, setGroups] = useState<ChannelGroup[]>([])
+  const [selectedGroup, setSelectedGroup] = useState('')
+  const [totalChannelCount, setTotalChannelCount] = useState(0)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [anchorDate, setAnchorDate] = useState<Date>(() => {
     const now = new Date()
-    const minutes = now.getMinutes()
-    const roundedMinutes = Math.floor(minutes / 30) * 30
-    now.setMinutes(roundedMinutes, 0, 0)
+    now.setMinutes(0, 0, 0)
     return now
   })
 
+  const currentWindowStart = useMemo(() => {
+    const d = new Date(anchorDate)
+    d.setMinutes(0, 0, 0)
+    return d
+  }, [anchorDate])
+
   const windowEnd = useMemo(() => {
     const end = new Date(currentWindowStart)
-    end.setHours(end.getHours() + 6) // 6-hour window
+    end.setHours(end.getHours() + WINDOW_HOURS)
     return end
   }, [currentWindowStart])
 
-  const channelIds = useMemo(() => channels.map(c => c.id), [channels])
+  const filteredChannels = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q) return channels
+    return channels.filter((channel) => {
+      const number = channel.channelNumber?.toString() ?? ''
+      return channel.name.toLowerCase().includes(q) || number.includes(q)
+    })
+  }, [channels, searchQuery])
+
+  const channelIds = useMemo(
+    () => (channelsLoading ? undefined : filteredChannels.map((c) => c.id)),
+    [filteredChannels, channelsLoading],
+  )
 
   const { programs, loading: epgLoading, error } = useEpg({
     channelIds,
     start: currentWindowStart.toISOString(),
-    end: windowEnd.toISOString()
+    end: windowEnd.toISOString(),
   })
 
-  // Group programs by channel
   const programsByChannel = useMemo(() => {
     const grouped = new Map<string, Program[]>()
-    programs.forEach(program => {
+    programs.forEach((program) => {
       const channelPrograms = grouped.get(program.channelId) || []
       channelPrograms.push(program)
       grouped.set(program.channelId, channelPrograms)
     })
-    // Sort programs by start time for each channel
-    grouped.forEach(programs => {
-      programs.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+    grouped.forEach((channelPrograms) => {
+      channelPrograms.sort(
+        (a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime(),
+      )
     })
     return grouped
   }, [programs])
 
   useEffect(() => {
-    const fetchChannels = async () => {
+    const fetchData = async () => {
       try {
         setChannelsLoading(true)
-        const response = await getChannels({ perPage: 100 })
-        setChannels(response.data)
-      } catch (err) {
-        // Handle error silently for now
+        const [channelsRes, groupsRes] = await Promise.all([
+          getChannels({ groupTitle: selectedGroup || undefined, perPage: 200 }),
+          getGroups(),
+        ])
+        setChannels(channelsRes.data)
+        setGroups(groupsRes)
+        const total = groupsRes.reduce((sum, g) => sum + g.count, 0)
+        setTotalChannelCount(total)
+      } catch {
+        setChannels([])
       } finally {
         setChannelsLoading(false)
       }
     }
-    fetchChannels()
-  }, [])
+    fetchData()
+  }, [selectedGroup])
 
   const goToNow = () => {
     const now = new Date()
-    const minutes = now.getMinutes()
-    const roundedMinutes = Math.floor(minutes / 30) * 30
-    now.setMinutes(roundedMinutes, 0, 0)
-    setCurrentWindowStart(now)
+    now.setMinutes(0, 0, 0)
+    setAnchorDate(now)
   }
 
-  const navigateTime = (hours: number) => {
-    const newStart = new Date(currentWindowStart)
-    newStart.setHours(newStart.getHours() + hours)
-    setCurrentWindowStart(newStart)
+  const navigateHours = (hours: number) => {
+    const next = new Date(anchorDate)
+    next.setHours(next.getHours() + hours)
+    setAnchorDate(next)
   }
 
-  const formatTime = (date: Date) => {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const navigateDays = (days: number) => {
+    const next = new Date(anchorDate)
+    next.setDate(next.getDate() + days)
+    setAnchorDate(next)
   }
 
-  const formatDate = (date: Date) => {
-    return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })
+  const goToDate = (dateStr: string) => {
+    const next = new Date(dateStr)
+    next.setHours(anchorDate.getHours(), 0, 0, 0)
+    setAnchorDate(next)
   }
 
-  const getProgramWidth = (program: Program) => {
+  const formatTime = (date: Date) =>
+    date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+  const formatDate = (date: Date) =>
+    date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })
+
+  const getProgramWidth = useCallback((program: Program) => {
     const start = new Date(program.startTime)
     const end = new Date(program.endTime)
-    const duration = (end.getTime() - start.getTime()) / (1000 * 60) // minutes
-    return Math.max(120, (duration / 30) * 120) // 120px per 30-min slot, minimum 120px
-  }
+    const duration = (end.getTime() - start.getTime()) / (1000 * 60)
+    return Math.max(90, (duration / SLOT_MINUTES) * PIXELS_PER_SLOT)
+  }, [])
 
-  const getProgramOffset = (program: Program) => {
+  const getProgramOffset = useCallback((program: Program) => {
     const programStart = new Date(program.startTime)
-    const windowStart = currentWindowStart
-    const offsetMinutes = (programStart.getTime() - windowStart.getTime()) / (1000 * 60)
-    return Math.max(0, (offsetMinutes / 30) * 120) // 120px per 30-min slot
-  }
+    const offsetMinutes =
+      (programStart.getTime() - currentWindowStart.getTime()) / (1000 * 60)
+    return Math.max(0, (offsetMinutes / SLOT_MINUTES) * PIXELS_PER_SLOT)
+  }, [currentWindowStart])
 
   const isNowVisible = () => {
     const now = new Date()
@@ -109,7 +148,7 @@ export default function EpgGrid({ onProgramSelect }: EpgGridProps) {
     if (!isNowVisible()) return 0
     const now = new Date()
     const offsetMinutes = (now.getTime() - currentWindowStart.getTime()) / (1000 * 60)
-    return 160 + (offsetMinutes / 30) * 120 // 160px channel column + offset
+    return CHANNEL_COLUMN_WIDTH + (offsetMinutes / SLOT_MINUTES) * PIXELS_PER_SLOT
   }
 
   const timeSlots = useMemo(() => {
@@ -117,28 +156,35 @@ export default function EpgGrid({ onProgramSelect }: EpgGridProps) {
     const current = new Date(currentWindowStart)
     while (current < windowEnd) {
       slots.push(new Date(current))
-      current.setMinutes(current.getMinutes() + 30)
+      current.setMinutes(current.getMinutes() + SLOT_MINUTES)
     }
     return slots
   }, [currentWindowStart, windowEnd])
 
   if (channelsLoading) {
     return (
-      <div className="p-6">
-        <div className="animate-pulse">
-          <div className="h-8 bg-surface-50 rounded mb-4"></div>
-          <div className="space-y-3">
-            {[...Array(8)].map((_, i) => (
-              <div key={i} className="flex gap-4">
-                <div className="w-40 h-12 bg-surface-50 rounded"></div>
-                <div className="flex gap-2 flex-1">
-                  <div className="w-32 h-12 bg-surface-50 rounded"></div>
-                  <div className="w-48 h-12 bg-surface-50 rounded"></div>
-                  <div className="w-24 h-12 bg-surface-50 rounded"></div>
-                </div>
-              </div>
-            ))}
+      <div className="flex flex-col h-full">
+        {/* Keep the toolbar visible during channel load so it doesn't jump */}
+        <div className="p-4 border-b border-navy-600 bg-navy-800 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h2 className="font-mono text-gold text-xs uppercase tracking-widest mb-1">Guide</h2>
+              <div className="h-4 w-40 bg-navy-700 rounded animate-pulse" />
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="h-8 w-10 bg-navy-700 rounded animate-pulse" />
+              <div className="h-8 w-16 bg-navy-700 rounded animate-pulse" />
+              <div className="h-8 w-10 bg-navy-700 rounded animate-pulse" />
+            </div>
           </div>
+        </div>
+        <div className="flex-1 p-4 space-y-2">
+          {[...Array(10)].map((_, i) => (
+            <div key={i} className="flex gap-2">
+              <div className="h-12 w-48 bg-navy-700 rounded animate-pulse flex-shrink-0" />
+              <div className="h-12 flex-1 bg-navy-700 rounded animate-pulse" />
+            </div>
+          ))}
         </div>
       </div>
     )
@@ -148,8 +194,8 @@ export default function EpgGrid({ onProgramSelect }: EpgGridProps) {
     return (
       <div className="p-6">
         <div className="text-center py-8">
-          <p className="text-gray-400 mb-4">No EPG data available</p>
-          <p className="text-sm text-gray-500">Add a source with EPG URL in Settings</p>
+          <p className="text-white/60 mb-2">No EPG data available</p>
+          <p className="text-sm text-navy-400">Add a source with working EPG in Settings</p>
         </div>
       </div>
     )
@@ -157,141 +203,180 @@ export default function EpgGrid({ onProgramSelect }: EpgGridProps) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Time Navigation */}
-      <div className="p-4 border-b border-border bg-surface-50">
-        <div className="flex items-center justify-between">
+      <div className="p-4 border-b border-navy-600 bg-navy-800 space-y-3">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
           <div>
-            <h2 className="font-mono text-amber-500 text-xs uppercase tracking-widest mb-1">
-              Guide
-            </h2>
-            <p className="text-sm text-gray-400">
+            <h2 className="font-mono text-gold text-xs uppercase tracking-widest mb-1">Guide</h2>
+            <p className="text-sm text-white/50">
               {formatDate(currentWindowStart)} • {formatTime(currentWindowStart)} - {formatTime(windowEnd)}
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
             <button
-              onClick={() => navigateTime(-3)}
-              className="px-3 py-1 bg-surface-100 hover:bg-surface-200 border border-border rounded text-sm"
+              onClick={() => navigateHours(-4)}
+              className="px-2 py-1 bg-navy-700 hover:bg-navy-600 border border-navy-500 rounded text-sm text-white/60"
             >
-              ← 3h
+              -4h
             </button>
             <button
               onClick={goToNow}
-              className="px-3 py-1 bg-amber-500 hover:bg-amber-600 text-black font-semibold rounded text-sm"
+              className="px-3 py-1 bg-gold hover:bg-gold-muted text-navy font-semibold rounded text-sm"
             >
               Now
             </button>
             <button
-              onClick={() => navigateTime(3)}
-              className="px-3 py-1 bg-surface-100 hover:bg-surface-200 border border-border rounded text-sm"
+              onClick={() => navigateHours(4)}
+              className="px-2 py-1 bg-navy-700 hover:bg-navy-600 border border-navy-500 rounded text-sm text-white/60"
             >
-              3h →
+              +4h
             </button>
           </div>
         </div>
+
+        <div className="grid gap-3 md:grid-cols-3">
+          <div>
+            <label className="block text-xs text-navy-400 mb-1">Search</label>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Find channel..."
+              className="w-full px-3 py-2 bg-navy-700 border border-navy-500 rounded text-sm text-white focus:outline-none focus:border-gold placeholder-navy-400"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-navy-400 mb-1">Group</label>
+            <select
+              value={selectedGroup}
+              onChange={(e) => setSelectedGroup(e.target.value)}
+              className="w-full px-3 py-2 bg-navy-700 border border-navy-500 rounded text-sm text-white focus:outline-none focus:border-gold"
+            >
+              <option value="">All ({totalChannelCount})</option>
+              {groups.map((g) => (
+                <option key={g.name} value={g.name}>
+                  {g.name} ({g.count})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-navy-400 mb-1">Date</label>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => navigateDays(-1)}
+                className="px-2 py-2 bg-navy-700 hover:bg-navy-600 border border-navy-500 rounded text-sm text-white/60"
+                title="Previous day"
+              >
+                ‹
+              </button>
+              <input
+                type="date"
+                value={anchorDate.toISOString().split('T')[0]}
+                onChange={(e) => goToDate(e.target.value)}
+                className="flex-1 px-2 py-2 bg-navy-700 border border-navy-500 rounded text-sm text-white focus:outline-none focus:border-gold"
+              />
+              <button
+                onClick={() => navigateDays(1)}
+                className="px-2 py-2 bg-navy-700 hover:bg-navy-600 border border-navy-500 rounded text-sm text-white/60"
+                title="Next day"
+              >
+                ›
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="text-xs text-navy-400">
+          Showing {filteredChannels.length} of {channels.length} channels
+          {epgLoading ? ' • Loading guide...' : ''}
+        </div>
       </div>
 
-      {/* EPG Grid */}
       <div className="flex-1 overflow-auto relative">
-        {/* Time Header */}
-        <div className="sticky top-0 z-10 bg-surface-100 border-b border-border flex">
-          <div className="w-40 p-2 border-r border-border"></div>
+        <div className="sticky top-0 z-10 bg-navy-800 border-b border-navy-600 flex">
+          <div
+            className="p-2 border-r border-navy-600 text-xs text-navy-400 font-medium"
+            style={{ width: `${CHANNEL_COLUMN_WIDTH}px`, minWidth: `${CHANNEL_COLUMN_WIDTH}px` }}
+          >
+            Channel
+          </div>
           {timeSlots.map((time, i) => (
-            <div 
-              key={i} 
-              className="w-30 p-2 text-center border-r border-border font-mono text-xs text-gray-400"
-              style={{ minWidth: '120px' }}
+            <div
+              key={i}
+              className="p-2 text-center border-r border-navy-600 font-mono text-xs text-navy-400"
+              style={{ minWidth: `${PIXELS_PER_SLOT}px` }}
             >
               {formatTime(time)}
             </div>
           ))}
         </div>
 
-        {/* Channel Rows */}
         <div className="relative">
-          {channels.map((channel) => (
-            <div key={channel.id} className="flex border-b border-border-muted min-h-16 relative">
-              {/* Channel Name */}
-              <div className="w-40 p-3 border-r border-border bg-surface-50 flex items-center">
-                <div>
-                  <div className="font-semibold text-sm text-gray-200 truncate">
-                    {channel.name}
-                  </div>
+          {filteredChannels.map((channel) => (
+            <div key={channel.id} className="flex border-b border-navy-700 min-h-14 relative">
+              <button
+                type="button"
+                onClick={() => onChannelClick?.(channel.id)}
+                className="p-2 border-r border-navy-600 bg-navy-800 flex items-center hover:bg-navy-700 transition-colors"
+                style={{ width: `${CHANNEL_COLUMN_WIDTH}px`, minWidth: `${CHANNEL_COLUMN_WIDTH}px` }}
+              >
+                <div className="min-w-0 text-left">
+                  <div className="font-semibold text-sm text-white truncate">{channel.name}</div>
                   {channel.channelNumber && (
-                    <div className="text-xs text-gray-400">
-                      {channel.channelNumber}
-                    </div>
+                    <div className="text-xs text-navy-400">CH {channel.channelNumber}</div>
                   )}
                 </div>
-              </div>
+              </button>
 
-              {/* Program Cells */}
-              <div className="flex-1 relative h-16">
-                {programsByChannel.get(channel.id)?.map((program) => (
-                  <div
-                    key={program.id}
-                    className="absolute top-1 bottom-1 bg-surface-100 border border-border hover:bg-surface-200 cursor-pointer rounded px-2 py-1 overflow-hidden"
-                    style={{
-                      left: `${getProgramOffset(program)}px`,
-                      width: `${getProgramWidth(program)}px`,
-                    }}
-                    onClick={() => {
-                      setSelectedProgram(program)
-                      onProgramSelect?.(program, channel.id)
-                    }}
-                  >
-                    <div className="text-sm font-medium text-gray-200 truncate">
-                      {program.title}
-                    </div>
-                    <div className="text-xs text-gray-400 truncate">
-                      {formatTime(new Date(program.startTime))} - {formatTime(new Date(program.endTime))}
-                    </div>
-                  </div>
-                ))}
+              <div className="flex-1 relative h-14">
+                {epgLoading ? (
+                  <div className="absolute inset-1 bg-navy-700 rounded animate-pulse opacity-50" />
+                ) : (
+                  programsByChannel.get(channel.id)?.map((program) => {
+                  const isSelected = program.id === selectedProgramId
+                  return (
+                    <button
+                      key={program.id}
+                      type="button"
+                      className={`absolute top-1 bottom-1 border rounded px-2 py-1 overflow-hidden text-left flex items-center gap-2 transition-colors ${
+                        isSelected
+                          ? 'bg-gold/20 border-gold text-white'
+                          : 'bg-navy-700 border-navy-600 hover:bg-navy-600 text-white/60'
+                      }`}
+                      style={{
+                        left: `${getProgramOffset(program)}px`,
+                        width: `${getProgramWidth(program)}px`,
+                      }}
+                      onClick={() => onProgramSelect?.(program, channel.id)}
+                    >
+                      {(program.posterUrl || program.logoUrl) && (
+                        <img
+                          src={program.logoUrl || program.posterUrl || ''}
+                          alt=""
+                          className="h-8 w-8 object-contain rounded flex-shrink-0 opacity-80"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-medium truncate">{program.title}</div>
+                        <div className="text-[11px] text-navy-400 truncate">
+                          {formatTime(new Date(program.startTime))} - {formatTime(new Date(program.endTime))}
+                        </div>
+                      </div>
+                    </button>
+                  )
+                })
+                )}
               </div>
             </div>
           ))}
 
-          {/* Now Line */}
           {isNowVisible() && (
             <div
-              className="absolute top-0 bottom-0 w-0.5 bg-amber-500 z-20 pointer-events-none"
+              className="absolute top-0 bottom-0 w-0.5 bg-gold z-20 pointer-events-none"
               style={{ left: `${getNowPosition()}px` }}
             />
           )}
         </div>
-
-        {/* Program Details Panel */}
-        {selectedProgram && (
-          <div className="absolute bottom-0 left-0 right-0 bg-surface-100 border-t border-border p-4 shadow-lg">
-            <div className="flex justify-between items-start">
-              <div className="flex-1">
-                <h3 className="font-semibold text-lg text-gray-100 mb-1">
-                  {selectedProgram.title}
-                </h3>
-                {selectedProgram.subtitle && (
-                  <p className="text-amber-500 font-medium mb-2">
-                    {selectedProgram.subtitle}
-                  </p>
-                )}
-                <p className="text-sm text-gray-400 mb-2 font-mono">
-                  {formatTime(new Date(selectedProgram.startTime))} - {formatTime(new Date(selectedProgram.endTime))} • {selectedProgram.category}
-                </p>
-                {selectedProgram.description && (
-                  <p className="text-gray-300 text-sm mb-4">
-                    {selectedProgram.description}
-                  </p>
-                )}
-              </div>
-              <button
-                onClick={() => setSelectedProgram(null)}
-                className="text-gray-400 hover:text-gray-200 text-xl ml-4"
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   )

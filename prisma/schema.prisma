@@ -30,6 +30,8 @@ model Source {
   xcPassword   String?
   // EPG
   epgUrl       String?                         // XMLTV URL (null if using XC EPG)
+  // Group filtering
+  disabledGroups String[]  @default([])
   // Sync
   lastSyncAt   DateTime?
   syncError    String?
@@ -238,6 +240,37 @@ model Notification {
 }
 
 // ============================================================
+// USERS — Authentication and authorization
+// ============================================================
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+model User {
+  id               String   @id @default(uuid())
+  username         String   @unique
+  passwordHash     String
+  role             UserRole @default(USER)
+  // Storage quota
+  storageQuotaGB   Int?                          // null = unlimited (admin default)
+  // Channel assignment — assigned source IDs and allowed group names
+  assignedSourceIds String[] @default([])        // which sources this user can see
+  assignedGroups   String[] @default([])         // allowed group names across those sources
+  // Playlist access token
+  playlistToken    String?  @unique              // null = no token required for this user
+  requireToken     Boolean  @default(false)      // if true, token is required to access playlist
+  // State
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([username])
+  @@index([playlistToken])
+}
+
+// ============================================================
 // SETTINGS — Key-value app settings
 // ============================================================
 
@@ -245,4 +278,31 @@ model Setting {
   key       String   @id
   value     String                             // JSON-encoded value
   updatedAt DateTime @updatedAt
+}
+
+// ============================================================
+// SHOW METADATA — TMDB enrichment cache for EPG programs
+// ============================================================
+
+model ShowMetadata {
+  id            String   @id @default(uuid())
+  // Key for lookup
+  title        String                          // Normalized show title (lowercase, trimmed)
+  // TMDB data
+  tmdbId       Int?                           // TMDB TV show or movie ID
+  tmdbType     String?                        // "tv" or "movie"
+  posterUrl    String?                        // TMDB poster
+  backdropUrl  String?                        // TMDB backdrop
+  logoUrl      String?                        // TMDB logo (preferred over poster for guide)
+  overview     String?                        // Show description
+  genres       String[]                       // Genre names from TMDB
+  firstAirDate String?                        // First air date (TV) or release date (movie)
+  // Episode-level overrides
+  episodePosterUrl   String?                   // Per-season/episode still image URL
+  // State
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([title])
+  @@index([title])
 }

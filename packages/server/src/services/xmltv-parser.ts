@@ -40,6 +40,7 @@ const parser = new XMLParser({
   textNodeName: '#text',
   parseAttributeValue: false,
   trimValues: true,
+  processEntities: false,
 });
 
 /**

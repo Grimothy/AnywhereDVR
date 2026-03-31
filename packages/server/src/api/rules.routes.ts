@@ -22,6 +22,7 @@ const createSeriesRuleSchema = z.object({
 
 const createOnceRuleSchema = z.object({
   type: z.literal('ONCE'),
+  channelId: z.string().uuid().optional(),  // stored for fallback matching
   programId: z.string().uuid(),
   priority: z.number().int().min(1).max(100).optional().default(50),
   startEarly: z.number().int().min(0).optional().default(0),
@@ -143,6 +144,8 @@ rulesRouter.post('/', async (req, res, next) => {
         });
         return;
       }
+      // Ensure channelId is set from the program (authoritative source)
+      (data as typeof data & { channelId: string }).channelId = program.channelId;
     }
 
     if ('channelId' in data && data.channelId) {

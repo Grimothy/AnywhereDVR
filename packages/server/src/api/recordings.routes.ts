@@ -1,7 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import fs from 'fs/promises';
+import { join } from 'path';
 import { db } from '../db.js';
 import { logger } from '../logger.js';
+import { config } from '../config.js';
+import { recorder } from '../services/recorder.js';
+import { notificationManager } from '../services/notification-manager.js';
 
 export const recordingsRouter = Router();
 
@@ -55,7 +60,13 @@ recordingsRouter.get('/', async (req, res, next) => {
     const { status, title, page, perPage } = parsed.data;
 
     const where: Record<string, unknown> = {};
-    if (status) where.status = status;
+    if (status) {
+      where.status = status;
+    } else {
+      // By default exclude CANCELLED tombstones (soft-deleted recordings).
+      // A caller can still request them explicitly with ?status=CANCELLED.
+      where.status = { not: 'CANCELLED' };
+    }
     if (title) where.title = { contains: title, mode: 'insensitive' };
 
     const [recordings, total] = await Promise.all([
@@ -76,6 +87,33 @@ recordingsRouter.get('/', async (req, res, next) => {
       data: serializeRecordings(recordings),
       meta: { page, perPage, total },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/recordings/schedule/upcoming ────────────────
+// Upcoming scheduled recordings (next 7 days)
+// NOTE: Must be registered BEFORE /:id to avoid param shadowing
+
+recordingsRouter.get('/schedule/upcoming', async (_req, res, next) => {
+  try {
+    const now = new Date();
+    const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const upcoming = await db.recording.findMany({
+      where: {
+        status: { in: ['SCHEDULED', 'RECORDING'] },
+        scheduledStart: { lte: weekFromNow },
+      },
+      orderBy: { scheduledStart: 'asc' },
+      include: {
+        channel: { select: { id: true, name: true, tvgLogo: true } },
+        rule: { select: { id: true, type: true, seriesTitle: true } },
+      },
+    });
+
+    res.json({ data: serializeRecordings(upcoming) });
   } catch (err) {
     next(err);
   }
@@ -156,10 +194,39 @@ recordingsRouter.delete('/:id', async (req, res, next) => {
       return;
     }
 
-    // TODO: Phase 4 — delete files from disk (filePath, sidecarPath, edlPath)
-    await db.recording.delete({ where: { id: req.params.id } });
+    // Delete files from disk (best-effort — log errors but don't block DB update)
+    const relPaths = [recording.filePath, recording.sidecarPath, recording.edlPath].filter(Boolean) as string[];
+    for (const relPath of relPaths) {
+      const absPath = relPath.startsWith('/') ? relPath : join(config.recordingsPath, relPath);
+      try {
+        await fs.unlink(absPath);
+        logger.info({ recordingId: req.params.id, absPath }, 'Deleted recording file');
+      } catch (fileErr: unknown) {
+        if ((fileErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+          logger.warn({ recordingId: req.params.id, absPath, err: fileErr }, 'Failed to delete recording file');
+        }
+      }
+    }
 
-    logger.info({ recordingId: req.params.id }, 'Recording deleted');
+    // Soft-delete: mark CANCELLED and clear file paths rather than removing the row.
+    // This prevents the scheduler from re-scheduling the same program on the next tick,
+    // since the dedup check includes CANCELLED status.
+    await db.recording.update({
+      where: { id: req.params.id },
+      data: {
+        status: 'CANCELLED',
+        errorMessage: 'Deleted by user',
+        filePath: null,
+        sidecarPath: null,
+        edlPath: null,
+        livePath: null,
+        fileSize: null,
+        duration: null,
+        ffmpegPid: null,
+      },
+    });
+
+    logger.info({ recordingId: req.params.id }, 'Recording deleted (soft)');
 
     res.status(204).send();
   } catch (err) {
@@ -199,8 +266,24 @@ recordingsRouter.post('/:id/cancel', async (req, res, next) => {
       return;
     }
 
-    // If recording is active, the recorder needs to stop ffmpeg
-    // The scheduler/recorder will check for CANCELLED status and handle cleanup
+    if (recording.status === 'RECORDING' && recorder.isActive(recording.id)) {
+      // Stop ffmpeg immediately — recorder.cancel() handles graceful shutdown,
+      // sets status to CANCELLED, and removes it from the active map.
+      // Run async; respond immediately so the UI doesn't block for 10s.
+      recorder.cancel(recording.id).catch((err) => {
+        logger.error({ recordingId: recording.id, err }, 'Error during recording cancel');
+      });
+
+      logger.info({ recordingId: recording.id }, 'Cancel initiated — stopping ffmpeg');
+
+      // Emit cancellation event immediately so UI updates without waiting for the scheduler tick
+      notificationManager.socketEmit('recording:cancelled', { recordingId: recording.id });
+
+      res.json({ data: serializeRecording({ ...recording, status: 'CANCELLED' }) });
+      return;
+    }
+
+    // SCHEDULED (not yet started) — just mark cancelled in DB
     const updated = await db.recording.update({
       where: { id: req.params.id },
       data: {
@@ -209,35 +292,9 @@ recordingsRouter.post('/:id/cancel', async (req, res, next) => {
       },
     });
 
-    logger.info({ recordingId: req.params.id, wasRecording: recording.status === 'RECORDING' }, 'Recording cancelled');
+    logger.info({ recordingId: req.params.id }, 'Scheduled recording cancelled');
 
     res.json({ data: serializeRecording(updated) });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ── GET /api/v1/recordings/schedule/upcoming ────────────────
-// Upcoming scheduled recordings (next 7 days)
-
-recordingsRouter.get('/schedule/upcoming', async (_req, res, next) => {
-  try {
-    const now = new Date();
-    const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-    const upcoming = await db.recording.findMany({
-      where: {
-        status: { in: ['SCHEDULED', 'RECORDING'] },
-        scheduledStart: { lte: weekFromNow },
-      },
-      orderBy: { scheduledStart: 'asc' },
-      include: {
-        channel: { select: { id: true, name: true, tvgLogo: true } },
-        rule: { select: { id: true, type: true, seriesTitle: true } },
-      },
-    });
-
-    res.json({ data: serializeRecordings(upcoming) });
   } catch (err) {
     next(err);
   }

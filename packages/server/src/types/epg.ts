@@ -50,4 +50,10 @@ export interface EpgProgram {
   isScheduled: boolean;          // Has matching recording rule
   isRecording: boolean;          // Currently being recorded
   recordingId: string | null;    // Recording ID if scheduled/recording
+  // Enriched metadata from TMDB
+  posterUrl: string | null;
+  backdropUrl: string | null;
+  logoUrl: string | null;
+  overview: string | null;
+  genres: string[];
 }

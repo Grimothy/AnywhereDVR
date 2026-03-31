@@ -28,12 +28,13 @@ const createSourceSchema = z.discriminatedUnion('type', [
 
 const updateSourceSchema = z.object({
   name: z.string().min(1).max(255).optional(),
-  m3uUrl: z.string().url().optional(),
+  m3uUrl: z.string().url().nullable().optional(),
   epgUrl: z.string().url().nullable().optional(),
-  xcHost: z.string().url().optional(),
-  xcUsername: z.string().min(1).optional(),
-  xcPassword: z.string().min(1).optional(),
+  xcHost: z.string().url().nullable().optional(),
+  xcUsername: z.string().min(1).nullable().optional(),
+  xcPassword: z.string().min(1).nullable().optional(),
   refreshDaily: z.boolean().optional(),
+  disabledGroups: z.array(z.string()).optional(),
 });
 
 // ── GET /api/v1/sources ─────────────────────────────────────
@@ -213,6 +214,109 @@ sourcesRouter.post('/:id/sync', async (req, res, next) => {
         channelCount: result.channelCount,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/sources/:id/groups ──────────────────────────
+// Returns all group titles for a source (including disabled ones)
+// with their channel counts and enabled/disabled state.
+
+const updateGroupsSchema = z.object({
+  disabledGroups: z.array(z.string()),
+});
+
+sourcesRouter.get('/:id/groups', async (req, res, next) => {
+  try {
+    const source = await db.source.findUnique({ where: { id: req.params.id } });
+    if (!source) {
+      res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Source not found' },
+      });
+      return;
+    }
+
+    // Query ALL channels for this source (regardless of isActive) to get every group
+    const rows = await db.channel.groupBy({
+      by: ['groupTitle'],
+      where: { sourceId: req.params.id },
+      _count: { id: true },
+      orderBy: { groupTitle: 'asc' },
+    });
+
+    const disabledGroups: string[] = (source as unknown as { disabledGroups?: string[] }).disabledGroups ?? [];
+
+    const groups = rows.map((row) => ({
+      name: row.groupTitle ?? '',
+      count: row._count.id,
+      disabled: disabledGroups.includes(row.groupTitle ?? ''),
+    }));
+
+    res.json({ data: groups });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PUT /api/v1/sources/:id/groups ──────────────────────────
+// Updates which groups are disabled for a source and immediately
+// applies isActive to existing channels (no re-sync required).
+
+sourcesRouter.put('/:id/groups', async (req, res, next) => {
+  try {
+    const parsed = updateGroupsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid request body',
+          details: parsed.error.flatten(),
+        },
+      });
+      return;
+    }
+
+    const source = await db.source.findUnique({ where: { id: req.params.id } });
+    if (!source) {
+      res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Source not found' },
+      });
+      return;
+    }
+
+    const { disabledGroups } = parsed.data;
+
+    // Persist preference on the source
+    await db.source.update({
+      where: { id: req.params.id },
+      data: { disabledGroups } as Record<string, unknown>,
+    });
+
+    // Apply isActive to all channels for this source immediately
+    await db.$transaction([
+      // Re-enable all channels first
+      db.channel.updateMany({
+        where: { sourceId: req.params.id },
+        data: { isActive: true },
+      }),
+      // Then disable channels in disabled groups (if any)
+      ...(disabledGroups.length > 0
+        ? [
+            db.channel.updateMany({
+              where: { sourceId: req.params.id, groupTitle: { in: disabledGroups } },
+              data: { isActive: false },
+            }),
+          ]
+        : []),
+    ]);
+
+    logger.info(
+      { sourceId: req.params.id, disabledGroups },
+      'Source group preferences updated',
+    );
+
+    res.json({ data: { disabledGroups } });
   } catch (err) {
     next(err);
   }

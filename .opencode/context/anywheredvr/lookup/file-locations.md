@@ -83,7 +83,7 @@ anywhereDVR/
 | `pages/Status.tsx` | System dashboard |
 | `pages/Settings.tsx` | Source management + config |
 | `components/Layout.tsx` | App shell with nav |
-| `components/EpgGrid.tsx` | Time-based EPG grid |
+| `components/EpgGrid.tsx` | Searchable, group-filtered compact EPG grid |
 | `components/RecordingCard.tsx` | Recording card |
 | `components/RecordButton.tsx` | One-click record |
 

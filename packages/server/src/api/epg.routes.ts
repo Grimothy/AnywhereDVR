@@ -2,9 +2,31 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { db } from '../db.js';
 import { epgManager } from '../services/epg-manager.js';
-import { EpgChannelPrograms } from '../types/epg.js';
+import { EpgChannelPrograms, EpgProgram } from '../types/epg.js';
+import { normalizeTitle } from '../services/metadata-enricher.js';
 
 export const epgRouter = Router();
+
+// ── In-memory EPG guide cache (30 s TTL) ────────────────────
+// Key: "<startISO>|<endISO>|<sortedChannelIds>" → { data, expiresAt }
+interface CacheEntry {
+  data: ReturnType<typeof buildGuideResponse>;
+  expiresAt: number;
+}
+const guideCache = new Map<string, CacheEntry>();
+const GUIDE_CACHE_TTL_MS = 30_000;
+
+function buildGuideResponse(channels: EpgChannelPrograms[], startTime: Date, endTime: Date) {
+  return {
+    data: { channels },
+    meta: {
+      start: startTime.toISOString(),
+      end: endTime.toISOString(),
+      channelCount: channels.length,
+      programCount: channels.reduce((sum, ch) => sum + ch.programs.length, 0),
+    },
+  };
+}
 
 // ── Validation Schemas ──────────────────────────────────────
 
@@ -37,22 +59,32 @@ epgRouter.get('/', async (req, res, next) => {
     const startTime = start ? new Date(start) : new Date();
     const endTime = end ? new Date(end) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    // Parse channelIds filter
+    // Parse and sort channelIds for stable cache keys
     const channelIdArray = channelIds
-      ? channelIds.split(',').map(id => id.trim()).filter(id => id.length > 0)
+      ? channelIds.split(',').map(id => id.trim()).filter(id => id.length > 0).sort()
       : undefined;
+
+    // Check cache
+    const cacheKey = `${startTime.toISOString()}|${endTime.toISOString()}|${channelIdArray?.join(',') ?? '*'}`;
+    const cached = guideCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.json(cached.data);
+      return;
+    }
 
     // Build where clause
     const where: Record<string, unknown> = {
-      startTime: { gte: startTime },
-      endTime: { lte: endTime },
+      // Include any program that overlaps the requested window.
+      // Fully-contained filtering leaves gaps at boundaries in compact guide views.
+      startTime: { lt: endTime },
+      endTime: { gt: startTime },
     };
 
     if (channelIdArray && channelIdArray.length > 0) {
       where.channelId = { in: channelIdArray };
     }
 
-    // Fetch programs with channel data
+    // Fetch programs first (recordings + metadata depend on the result)
     const programs = await db.program.findMany({
       where,
       include: {
@@ -70,6 +102,71 @@ epgRouter.get('/', async (req, res, next) => {
       ],
     });
 
+    // Fetch recordings and metadata in parallel — neither depends on the other
+    const uniqueTitles = [...new Set(programs.map(p => normalizeTitle(p.title)).filter(Boolean))];
+
+    const [overlappingRecordings, metadataRecords] = await Promise.all([
+      db.recording.findMany({
+        where: {
+          scheduledStart: { lt: endTime },
+          scheduledEnd:   { gt: startTime },
+          status: { in: ['SCHEDULED', 'RECORDING'] },
+        },
+        select: {
+          id: true,
+          programId: true,
+          status: true,
+          channelId: true,
+          scheduledStart: true,
+          scheduledEnd: true,
+        },
+      }),
+      db.showMetadata.findMany({
+        where: { title: { in: uniqueTitles } },
+        select: {
+          title: true,
+          posterUrl: true,
+          backdropUrl: true,
+          logoUrl: true,
+          overview: true,
+          genres: true,
+        },
+      }),
+    ]);
+
+    // Build lookup: programId → recording
+    const recordingByProgramId = new Map(
+      overlappingRecordings.filter(r => r.programId).map(r => [r.programId!, r])
+    );
+
+    const metadataByNormalizedTitle = new Map(metadataRecords.map(m => [m.title, m]));
+
+    // Build enriched program object
+    function buildEpgProgram(prog: typeof programs[number]): EpgProgram {
+      const rec = recordingByProgramId.get(prog.id);
+      const meta = metadataByNormalizedTitle.get(normalizeTitle(prog.title));
+      return {
+        id: prog.id,
+        title: prog.title,
+        subtitle: prog.subtitle,
+        description: prog.description,
+        startTime: prog.startTime.toISOString(),
+        endTime: prog.endTime.toISOString(),
+        season: prog.season,
+        episode: prog.episode,
+        category: prog.category,
+        isNew: prog.isNew,
+        isScheduled: rec != null,
+        isRecording: rec?.status === 'RECORDING',
+        recordingId: rec?.id ?? null,
+        posterUrl: meta?.posterUrl ?? null,
+        backdropUrl: meta?.backdropUrl ?? null,
+        logoUrl: meta?.logoUrl ?? null,
+        overview: meta?.overview ?? null,
+        genres: meta?.genres ?? [],
+      };
+    }
+
     // Group by channel
     const channelMap = new Map<string, EpgChannelPrograms>();
 
@@ -85,33 +182,126 @@ epgRouter.get('/', async (req, res, next) => {
         });
       }
 
-      channelMap.get(channelId)!.programs.push({
-        id: prog.id,
-        title: prog.title,
-        subtitle: prog.subtitle,
-        description: prog.description,
-        startTime: prog.startTime.toISOString(),
-        endTime: prog.endTime.toISOString(),
-        season: prog.season,
-        episode: prog.episode,
-        category: prog.category,
-        isNew: prog.isNew,
-        isScheduled: false, // TODO: Check against recording rules (Phase 3)
-        isRecording: false, // TODO: Check against active recordings (Phase 3)
-        recordingId: null,  // TODO: Link to recording if exists (Phase 3)
-      });
+      channelMap.get(channelId)!.programs.push(buildEpgProgram(prog));
     }
 
     const channels = Array.from(channelMap.values());
 
-    res.json({
-      data: { channels },
-      meta: {
-        start: startTime.toISOString(),
-        end: endTime.toISOString(),
-        channelCount: channels.length,
-        programCount: programs.length,
+    const response = buildGuideResponse(channels, startTime, endTime);
+    guideCache.set(cacheKey, { data: response, expiresAt: Date.now() + GUIDE_CACHE_TTL_MS });
+    res.json(response);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/epg/search ─────────────────────────────────
+// Search upcoming programs by title
+
+const epgSearchSchema = z.object({
+  q: z.string().min(2, 'Query must be at least 2 characters'),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+epgRouter.get('/search', async (req, res, next) => {
+  try {
+    const parsed = epgSearchSchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid query parameters',
+          details: parsed.error.flatten(),
+        },
+      });
+      return;
+    }
+
+    const { q, limit } = parsed.data;
+    const now = new Date();
+
+    // Search upcoming programs by title (ILIKE contains)
+    const programs = await db.program.findMany({
+      where: {
+        title: { contains: q, mode: 'insensitive' },
+        startTime: { gte: now },
       },
+      include: {
+        channel: {
+          select: {
+            id: true,
+            name: true,
+            tvgLogo: true,
+            channelNumber: true,
+            groupTitle: true,
+          },
+        },
+      },
+      orderBy: { startTime: 'asc' },
+      take: limit,
+    });
+
+    // Fetch recordings that overlap these programs
+    const programIds = programs.map(p => p.id);
+    const recordings = await db.recording.findMany({
+      where: {
+        programId: { in: programIds },
+        status: { in: ['SCHEDULED', 'RECORDING'] },
+      },
+      select: { id: true, programId: true, status: true },
+    });
+    const recordingByProgramId = new Map(
+      recordings.filter(r => r.programId).map(r => [r.programId!, r])
+    );
+
+    // TMDB enrichment
+    const uniqueTitles = [...new Set(programs.map(p => normalizeTitle(p.title)).filter(Boolean))];
+    const metadataRecords = await db.showMetadata.findMany({
+      where: { title: { in: uniqueTitles } },
+      select: {
+        title: true,
+        posterUrl: true,
+        backdropUrl: true,
+        logoUrl: true,
+        overview: true,
+        genres: true,
+      },
+    });
+    const metadataByNormalizedTitle = new Map(metadataRecords.map(m => [m.title, m]));
+
+    const results = programs.map(prog => {
+      const rec = recordingByProgramId.get(prog.id);
+      const meta = metadataByNormalizedTitle.get(normalizeTitle(prog.title));
+      return {
+        id: prog.id,
+        channelId: prog.channel.id,
+        channelName: prog.channel.name,
+        channelLogo: prog.channel.tvgLogo ?? null,
+        channelNumber: prog.channel.channelNumber ?? null,
+        groupTitle: prog.channel.groupTitle ?? null,
+        title: prog.title,
+        subtitle: prog.subtitle ?? null,
+        description: prog.description ?? null,
+        startTime: prog.startTime.toISOString(),
+        endTime: prog.endTime.toISOString(),
+        season: prog.season ?? null,
+        episode: prog.episode ?? null,
+        category: prog.category ?? null,
+        isNew: prog.isNew,
+        isScheduled: rec != null,
+        isRecording: rec?.status === 'RECORDING',
+        recordingId: rec?.id ?? null,
+        posterUrl: meta?.posterUrl ?? null,
+        backdropUrl: meta?.backdropUrl ?? null,
+        logoUrl: meta?.logoUrl ?? null,
+        overview: meta?.overview ?? null,
+        genres: meta?.genres ?? [],
+      };
+    });
+
+    res.json({
+      data: { programs: results },
+      meta: { count: results.length, query: q },
     });
   } catch (err) {
     next(err);
@@ -160,32 +350,71 @@ epgRouter.get('/:channelId', async (req, res, next) => {
     const programs = await db.program.findMany({
       where: {
         channelId,
-        startTime: { gte: now },
-        endTime: { lte: endDate },
+        startTime: { lt: endDate },
+        endTime: { gt: now },
       },
       orderBy: { startTime: 'asc' },
     });
+
+    // Fetch scheduled/active recordings for this channel in the same window
+    const recordings = await db.recording.findMany({
+      where: {
+        channelId,
+        scheduledStart: { lt: endDate },
+        scheduledEnd:   { gt: now },
+        status: { in: ['SCHEDULED', 'RECORDING'] },
+      },
+      select: { id: true, programId: true, status: true },
+    });
+
+    const recordingByProgramId = new Map(
+      recordings.filter(r => r.programId).map(r => [r.programId!, r])
+    );
+
+    // Fetch enrichment metadata for all unique show titles
+    const uniqueTitles = [...new Set(programs.map(p => normalizeTitle(p.title)).filter(Boolean))];
+    const metadataRecords = await db.showMetadata.findMany({
+      where: { title: { in: uniqueTitles } },
+      select: {
+        title: true,
+        posterUrl: true,
+        backdropUrl: true,
+        logoUrl: true,
+        overview: true,
+        genres: true,
+      },
+    });
+    const metadataByNormalizedTitle = new Map(metadataRecords.map(m => [m.title, m]));
 
     res.json({
       data: {
         channelId: channel.id,
         channelName: channel.name,
         channelLogo: channel.tvgLogo,
-        programs: programs.map(prog => ({
-          id: prog.id,
-          title: prog.title,
-          subtitle: prog.subtitle,
-          description: prog.description,
-          startTime: prog.startTime.toISOString(),
-          endTime: prog.endTime.toISOString(),
-          season: prog.season,
-          episode: prog.episode,
-          category: prog.category,
-          isNew: prog.isNew,
-          isScheduled: false, // TODO: Phase 3
-          isRecording: false, // TODO: Phase 3
-          recordingId: null,  // TODO: Phase 3
-        })),
+        programs: programs.map(prog => {
+          const rec = recordingByProgramId.get(prog.id);
+          const meta = metadataByNormalizedTitle.get(normalizeTitle(prog.title));
+          return {
+            id: prog.id,
+            title: prog.title,
+            subtitle: prog.subtitle,
+            description: prog.description,
+            startTime: prog.startTime.toISOString(),
+            endTime: prog.endTime.toISOString(),
+            season: prog.season,
+            episode: prog.episode,
+            category: prog.category,
+            isNew: prog.isNew,
+            isScheduled: rec != null,
+            isRecording: rec?.status === 'RECORDING',
+            recordingId: rec?.id ?? null,
+            posterUrl: meta?.posterUrl ?? null,
+            backdropUrl: meta?.backdropUrl ?? null,
+            logoUrl: meta?.logoUrl ?? null,
+            overview: meta?.overview ?? null,
+            genres: meta?.genres ?? [],
+          };
+        }),
       },
     });
   } catch (err) {

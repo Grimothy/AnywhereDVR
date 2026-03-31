@@ -8,6 +8,7 @@ import { logger } from '../logger.js';
 import { getRecordingSettings } from '../types/recording.js';
 import type { ActiveRecording } from '../types/recording.js';
 import { postProcessor } from './post-processor.js';
+import { notificationManager } from './notification-manager.js';
 
 const GRACEFUL_STOP_TIMEOUT_MS = 10_000;
 const STDERR_BUFFER_MAX_BYTES = 4096;
@@ -174,6 +175,9 @@ export class Recorder {
       { recordingId, pid, title: recording.title },
       'Recording started',
     );
+
+    // Notify clients
+    void notificationManager.recordingStarted(recording.title, recordingId);
   }
 
   /**
@@ -298,22 +302,30 @@ export class Recorder {
             actualEnd: new Date(),
           },
         });
+
+        void notificationManager.recordingFailed(active.info.title, recordingId, errMsg);
       }
     });
 
     ffmpegProcess.on('error', (err) => {
       logger.error({ recordingId, err }, 'ffmpeg process error');
+      const active = this.activeRecordings.get(recordingId);
+      const title = active?.info.title ?? recordingId;
       this.activeRecordings.delete(recordingId);
+
+      const errMsg = `ffmpeg process error: ${err.message}`;
 
       void db.recording.update({
         where: { id: recordingId },
         data: {
           status: 'FAILED',
-          errorMessage: `ffmpeg process error: ${err.message}`,
+          errorMessage: errMsg,
           ffmpegPid: null,
           actualEnd: new Date(),
         },
       });
+
+      void notificationManager.recordingFailed(title, recordingId, errMsg);
     });
   }
 
@@ -354,7 +366,7 @@ export class Recorder {
       }
 
       // Update DB
-      await db.recording.update({
+      const updated = await db.recording.update({
         where: { id: recordingId },
         data: {
           status: graceful ? 'POST_PROCESSING' : 'FAILED',
@@ -363,6 +375,7 @@ export class Recorder {
           ffmpegPid: null,
           fileSize: totalSize > 0 ? totalSize : null,
         },
+        select: { title: true },
       });
 
       logger.info(
@@ -372,6 +385,7 @@ export class Recorder {
 
       // Trigger post-processor pipeline only on graceful stop (Phase 4)
       if (graceful) {
+        void notificationManager.recordingCompleted(updated.title, recordingId);
         void postProcessor.run(recordingId);
       }
     } catch (err) {

@@ -6,6 +6,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  withCredentials: true,
 })
 
 // Type definitions
@@ -13,12 +14,13 @@ interface Source {
   id: string
   name: string
   type: 'M3U' | 'XTREAM'
-  m3uUrl?: string
-  xcHost?: string
-  xcUsername?: string
-  xcPassword?: string
-  epgUrl?: string
+  m3uUrl?: string | null
+  xcHost?: string | null
+  xcUsername?: string | null
+  xcPassword?: string | null
+  epgUrl?: string | null
   refreshDaily: boolean
+  disabledGroups?: string[]
   lastSyncAt?: string
   syncError?: string
   createdAt: string
@@ -54,6 +56,15 @@ interface Program {
   episode?: number
   iconUrl?: string
   isNew: boolean
+  isScheduled?: boolean
+  isRecording?: boolean
+  recordingId?: string | null
+  // TMDB enrichment
+  posterUrl?: string | null
+  backdropUrl?: string | null
+  logoUrl?: string | null
+  overview?: string | null
+  genres?: string[]
 }
 
 interface Rule {
@@ -104,6 +115,9 @@ interface Recording {
   ffmpegPid?: number
   createdAt: string
   updatedAt: string
+  // Included relations (when the API joins them)
+  channel?: { id: string; name: string; tvgLogo?: string | null } | null
+  rule?: { id: string; type: string; seriesTitle?: string | null } | null
 }
 
 interface PaginatedResponse<T> {
@@ -126,12 +140,33 @@ export async function createSource(data: Partial<Source>): Promise<Source> {
   return response.data.data
 }
 
+export async function updateSource(id: string, data: Partial<Source>): Promise<Source> {
+  const response = await api.put(`/sources/${id}`, data)
+  return response.data.data
+}
+
 export async function deleteSource(id: string): Promise<void> {
   await api.delete(`/sources/${id}`)
 }
 
 export async function syncSource(id: string): Promise<void> {
   await api.post(`/sources/${id}/sync`)
+}
+
+export interface SourceGroup {
+  name: string
+  count: number
+  disabled: boolean
+}
+
+export async function getSourceGroups(id: string): Promise<SourceGroup[]> {
+  const response = await api.get(`/sources/${id}/groups`)
+  return response.data.data
+}
+
+export async function updateSourceGroups(id: string, disabledGroups: string[]): Promise<string[]> {
+  const response = await api.put(`/sources/${id}/groups`, { disabledGroups })
+  return response.data.data.disabledGroups
 }
 
 export async function getChannels(params?: {
@@ -145,12 +180,55 @@ export async function getChannels(params?: {
   return response.data
 }
 
+export interface ChannelGroup {
+  name: string
+  count: number
+}
+
+export async function getGroups(): Promise<ChannelGroup[]> {
+  const response = await api.get('/channels/groups/list')
+  return response.data.data
+}
+
 export async function getEpgGuide(params: {
   channelIds?: string[]
   start: string
   end: string
 }): Promise<Program[]> {
-  const response = await api.get('/epg/guide', { params })
+  const { channelIds, ...rest } = params
+  const response = await api.get('/epg', {
+    params: {
+      ...rest,
+      // Backend expects comma-separated string, not array
+      ...(channelIds && channelIds.length > 0 ? { channelIds: channelIds.join(',') } : {}),
+    },
+  })
+  // Backend returns { data: { channels: [{ channelId, programs: [] }] } }
+  // Flatten into a single Program[] with channelId on each program
+  const channels: Array<{ channelId: string; programs: Program[] }> = response.data.data.channels ?? []
+  return channels.flatMap(ch => ch.programs.map(p => ({ ...p, channelId: ch.channelId })))
+}
+
+export interface ProgramSearchResult extends Program {
+  channelId: string
+  channelName: string
+  channelLogo?: string | null
+  channelNumber?: number | null
+  groupTitle?: string | null
+}
+
+export async function searchPrograms(q: string, limit = 50): Promise<ProgramSearchResult[]> {
+  const response = await api.get('/epg/search', { params: { q, limit } })
+  return response.data.data.programs
+}
+
+export async function getChannelSchedule(channelId: string): Promise<{
+  channelId: string
+  channelName: string
+  channelLogo?: string | null
+  programs: Program[]
+}> {
+  const response = await api.get(`/epg/${channelId}`)
   return response.data.data
 }
 
@@ -161,6 +239,11 @@ export async function getRules(): Promise<Rule[]> {
 
 export async function createRule(data: Partial<Rule>): Promise<Rule> {
   const response = await api.post('/rules', data)
+  return response.data.data
+}
+
+export async function updateRule(id: string, data: Partial<Rule>): Promise<Rule> {
+  const response = await api.put(`/rules/${id}`, data)
   return response.data.data
 }
 
@@ -182,6 +265,16 @@ export async function deleteRecording(id: string): Promise<void> {
   await api.delete(`/recordings/${id}`)
 }
 
+export async function cancelRecording(id: string): Promise<Recording> {
+  const response = await api.post(`/recordings/${id}/cancel`)
+  return response.data.data
+}
+
+export async function getUpcomingSchedule(): Promise<Recording[]> {
+  const response = await api.get('/recordings/schedule/upcoming')
+  return response.data.data
+}
+
 // Export types
 export type {
   Source,
@@ -189,5 +282,144 @@ export type {
   Program,
   Rule,
   Recording,
-  PaginatedResponse
+  PaginatedResponse,
+}
+
+// ── Settings ────────────────────────────────────────────────
+
+export interface AppSettings {
+  maxConcurrentStreams?: string
+  globalDiskQuotaGB?: string
+  recordingsBasePath?: string
+  startEarlySeconds?: string
+  endLateSeconds?: string
+  epgRefreshIntervalHours?: string
+  sourceRefreshIntervalHours?: string
+  enableComskip?: string
+  enableTmdbEnrichment?: string
+  tmdbApiKey?: string
+  ffmpegPath?: string
+  comskipPath?: string
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const response = await api.get('/settings')
+  return response.data.data
+}
+
+export async function updateSettings(data: Partial<AppSettings>): Promise<AppSettings> {
+  const response = await api.put('/settings', data)
+  return response.data.data
+}
+
+// ── Users ────────────────────────────────────────────────────
+
+export interface AppUser {
+  id: string
+  username: string
+  role: 'ADMIN' | 'USER'
+  storageQuotaGB: number | null
+  assignedSourceIds: string[]
+  assignedGroups: string[]
+  playlistToken: string | null
+  requireToken: boolean
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface CreateUserData {
+  username: string
+  password: string
+  role?: 'ADMIN' | 'USER'
+  storageQuotaGB?: number | null
+  assignedSourceIds?: string[]
+  assignedGroups?: string[]
+  requireToken?: boolean
+}
+
+export interface UpdateUserData {
+  username?: string
+  password?: string
+  role?: 'ADMIN' | 'USER'
+  storageQuotaGB?: number | null
+  assignedSourceIds?: string[]
+  assignedGroups?: string[]
+  requireToken?: boolean
+  isActive?: boolean
+}
+
+export async function getUsers(): Promise<AppUser[]> {
+  const response = await api.get('/users')
+  return response.data.data
+}
+
+export async function getUser(id: string): Promise<AppUser> {
+  const response = await api.get(`/users/${id}`)
+  return response.data.data
+}
+
+export async function createUser(data: CreateUserData): Promise<AppUser> {
+  const response = await api.post('/users', data)
+  return response.data.data
+}
+
+export async function updateUser(id: string, data: UpdateUserData): Promise<AppUser> {
+  const response = await api.put(`/users/${id}`, data)
+  return response.data.data
+}
+
+export async function deleteUser(id: string): Promise<void> {
+  await api.delete(`/users/${id}`)
+}
+
+export async function regeneratePlaylistToken(id: string): Promise<{ playlistToken: string }> {
+  const response = await api.post(`/users/${id}/regenerate-token`)
+  return response.data.data
+}
+
+// ── Insights ─────────────────────────────────────────────────
+
+export interface InsightSuggestion {
+  type: string
+  title: string
+  body: string
+  severity: 'info' | 'warning' | 'tip'
+  action?: string
+  actionTarget?: string
+}
+
+export interface InsightsData {
+  stats: {
+    totalCompleted: number
+    totalStorageBytes: string
+    avgDurationSeconds: number
+    statusBreakdown: Record<string, number>
+    activePasses: number
+    totalPasses: number
+    upcomingCount: number
+  }
+  topCategories: Array<{ category: string; count: number }>
+  topChannels: Array<{ channelId: string; name: string; tvgLogo: string | null; count: number }>
+  suggestions: InsightSuggestion[]
+  recentFailed: Array<{
+    id: string
+    title: string
+    scheduledStart: string
+    errorMessage?: string
+    channel?: { id: string; name: string; tvgLogo?: string | null } | null
+  }>
+  upcoming: Array<{
+    id: string
+    title: string
+    scheduledStart: string
+    scheduledEnd: string
+    status: string
+    channel?: { id: string; name: string; tvgLogo?: string | null } | null
+  }>
+}
+
+export async function getInsights(): Promise<InsightsData> {
+  const response = await api.get('/insights')
+  return response.data.data
 }

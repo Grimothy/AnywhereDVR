@@ -1,7 +1,8 @@
 import { useState, useMemo } from 'react'
 import { useRecordings } from '../hooks/useRecordings.ts'
+import { useSocketEvent } from '../hooks/useSocket.ts'
 import RecordingCard from '../components/RecordingCard.tsx'
-import { deleteRecording, Recording } from '../api/client.ts'
+import { deleteRecording } from '../api/client.ts'
 
 type FilterStatus = 'all' | 'recording' | 'completed' | 'failed'
 type SortOption = 'newest' | 'oldest' | 'alphabetical'
@@ -19,6 +20,11 @@ export default function Recordings() {
     page,
     perPage
   })
+
+  // Auto-refresh when any recording changes state via Socket.IO
+  useSocketEvent('recording:completed', () => refetch())
+  useSocketEvent('recording:post_processing', () => refetch())
+  useSocketEvent('recording:cancelled', () => refetch())
 
   const sortedRecordings = useMemo(() => {
     const sorted = [...recordings]
@@ -42,7 +48,7 @@ export default function Recordings() {
     try {
       await deleteRecording(id)
       await refetch()
-    } catch (err) {
+    } catch {
       // Handle error silently for now
     }
   }
@@ -60,14 +66,14 @@ export default function Recordings() {
     return (
       <div className="p-6">
         <div className="animate-pulse">
-          <div className="h-8 bg-surface-50 rounded mb-6 w-48"></div>
+          <div className="h-8 bg-navy-700 rounded mb-6 w-48"></div>
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {[...Array(6)].map((_, i) => (
-              <div key={i} className="bg-surface-50 rounded-lg p-4">
-                <div className="h-6 bg-surface-100 rounded mb-3"></div>
-                <div className="h-4 bg-surface-100 rounded mb-2 w-3/4"></div>
-                <div className="h-4 bg-surface-100 rounded mb-4 w-1/2"></div>
-                <div className="h-8 bg-surface-100 rounded"></div>
+              <div key={i} className="bg-navy-700 rounded-xl p-4">
+                <div className="h-6 bg-navy-600 rounded mb-3"></div>
+                <div className="h-4 bg-navy-600 rounded mb-2 w-3/4"></div>
+                <div className="h-4 bg-navy-600 rounded mb-4 w-1/2"></div>
+                <div className="h-8 bg-navy-600 rounded"></div>
               </div>
             ))}
           </div>
@@ -80,7 +86,7 @@ export default function Recordings() {
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="font-mono text-amber-500 text-xs uppercase tracking-widest mb-4">
+        <h1 className="font-mono text-gold text-xs uppercase tracking-widest mb-4">
           Recordings
         </h1>
         
@@ -93,12 +99,12 @@ export default function Recordings() {
                 key={tab.key}
                 onClick={() => {
                   setFilterStatus(tab.key)
-                  setPage(1) // Reset to first page when filtering
+                  setPage(1)
                 }}
-                className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
                   filterStatus === tab.key
-                    ? 'bg-amber-500 text-black'
-                    : 'bg-surface-100 text-gray-400 hover:bg-surface-200 hover:text-gray-200'
+                    ? 'bg-gold text-navy font-semibold'
+                    : 'bg-navy-700 text-white/50 hover:bg-navy-600 hover:text-white border border-navy-600'
                 }`}
               >
                 {tab.label}
@@ -108,11 +114,11 @@ export default function Recordings() {
           
           {/* Sort */}
           <div className="flex items-center gap-2">
-            <label className="text-sm text-gray-400">Sort:</label>
+            <label className="text-sm text-navy-400">Sort:</label>
             <select
               value={sortOption}
               onChange={(e) => setSortOption(e.target.value as SortOption)}
-              className="bg-surface-100 border border-border rounded px-3 py-1 text-sm text-gray-200 focus:outline-none focus:border-amber-500"
+              className="bg-navy-700 border border-navy-500 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-gold"
             >
               <option value="newest">Newest</option>
               <option value="oldest">Oldest</option>
@@ -123,11 +129,11 @@ export default function Recordings() {
       </div>
 
       {error && (
-        <div className="bg-red-950/50 border border-red-800 rounded-lg p-4 mb-6">
-          <p className="text-red-300">Error loading recordings: {error}</p>
+        <div className="bg-rust/10 border border-rust/30 rounded-xl p-4 mb-6">
+          <p className="text-rust">Error loading recordings: {error}</p>
           <button
             onClick={refetch}
-            className="mt-2 px-3 py-1 bg-red-900 hover:bg-red-800 text-red-200 rounded text-sm"
+            className="mt-2 px-3 py-1.5 bg-rust/20 hover:bg-rust/30 text-rust rounded text-sm"
           >
             Retry
           </button>
@@ -136,9 +142,9 @@ export default function Recordings() {
 
       {/* Recordings Grid */}
       {sortedRecordings.length === 0 ? (
-        <div className="text-center py-12">
-          <p className="text-gray-400 mb-2">No recordings found</p>
-          <p className="text-sm text-gray-500">
+        <div className="text-center py-16">
+          <p className="text-white/50 mb-2">No recordings found</p>
+          <p className="text-sm text-navy-400">
             {filterStatus === 'all' 
               ? 'Start recording shows from the Guide'
               : `No ${filterStatus} recordings`}
@@ -162,17 +168,17 @@ export default function Recordings() {
               <button
                 onClick={() => setPage(Math.max(1, page - 1))}
                 disabled={page === 1}
-                className="px-3 py-1 bg-surface-100 hover:bg-surface-200 disabled:bg-surface-100/50 disabled:cursor-not-allowed border border-border rounded text-sm"
+                className="px-3 py-1.5 bg-navy-700 hover:bg-navy-600 disabled:opacity-40 disabled:cursor-not-allowed border border-navy-500 rounded text-sm text-white"
               >
                 Previous
               </button>
-              <span className="px-4 py-1 text-sm text-gray-400">
+              <span className="px-4 py-1.5 text-sm text-white/50">
                 Page {page} of {totalPages}
               </span>
               <button
                 onClick={() => setPage(Math.min(totalPages, page + 1))}
                 disabled={page === totalPages}
-                className="px-3 py-1 bg-surface-100 hover:bg-surface-200 disabled:bg-surface-100/50 disabled:cursor-not-allowed border border-border rounded text-sm"
+                className="px-3 py-1.5 bg-navy-700 hover:bg-navy-600 disabled:opacity-40 disabled:cursor-not-allowed border border-navy-500 rounded text-sm text-white"
               >
                 Next
               </button>
